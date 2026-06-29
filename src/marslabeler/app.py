@@ -36,7 +36,15 @@ def main():
 
     app = QApplication(sys.argv)
 
-    config_path = Path(args.config) if args.config else Path("configs/app.yaml")
+    if args.config:
+        config_path = Path(args.config)
+    else:
+        # Try multiple paths for config
+        potential_paths = [
+            Path("configs/app.yaml"),
+            Path(__file__).parent.parent.parent / "configs/app.yaml",
+        ]
+        config_path = next((p for p in potential_paths if p.exists()), Path("configs/app.yaml"))
     window = MainWindow(config_path)
     window.show()
 
