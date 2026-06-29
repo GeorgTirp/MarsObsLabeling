@@ -173,7 +173,7 @@ class MainWindow(QMainWindow):
             self.session = Session.load_or_create(
                 jp2_path,
                 grid,
-                self.config.__dict__,
+                self.config.to_dict(),
                 labels_dir,
                 labeler=self.config.labeler or "unknown",
             )

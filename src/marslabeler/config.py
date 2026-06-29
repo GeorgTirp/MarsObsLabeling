@@ -82,6 +82,11 @@ class AppConfig:
         """Run all validation checks."""
         self.geometry.validate()
 
+    def to_dict(self) -> dict:
+        """Convert to nested dict for Session."""
+        from dataclasses import asdict
+        return asdict(self)
+
 
 def load_config(config_path: str | Path) -> AppConfig:
     """Load and validate app config from YAML."""

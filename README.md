@@ -35,6 +35,19 @@ pip install -e '.[dev]'
 
 ## Quick Start
 
+### Installation
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -e .
+```
+
+### Run the tool
+```bash
+mars-label                    # Open GUI, choose JP2 file
+mars-label /path/to/file.jp2  # Open GUI with JP2 pre-loaded
+```
+
 ### Run tests
 ```bash
 pytest tests/ -v
@@ -44,6 +57,130 @@ pytest tests/ -v
 ```bash
 mars-label --help
 ```
+
+## Labeling Workflow
+
+### Open an observation
+1. Launch `mars-label`
+2. File → Open JP2 (or pass path on command line)
+3. Observation loads; first panel displays
+4. Legend shows terrain classes; history panel lists all panels
+
+### Label blocks
+Press the **hotkey** for the majority terrain class in the current block:
+- **q** = Smooth bedrock → label + auto-advance to next block
+- **w** = Fractured bedrock
+- **e** = Boulder field
+- **r** = Ripples/TARs
+- **a** = Sand sheet
+- **s** = Dust/mantled
+- **d** = Crater interior
+- **f** = Slope/scarp
+- **Space** = Abstain (uncertain/mixed) → auto-advance
+
+Blocks auto-advance to the next unlabeled block in reading order.
+
+### Navigate without labeling
+- **← / →** = Move left / right
+- **↑ / ↓** = Move up / down
+- **PageUp / PageDown** = Previous / next panel
+- **Home** = First block in current panel
+- **Click block** = Jump to that block
+- **Click panel in history** = Jump to that panel
+
+### Edit existing labels
+1. Navigate to a labeled block (arrow keys or click)
+2. Press a different class hotkey
+   - Overwrites the label (increments edit_count)
+   - **Does NOT auto-advance** (review before moving)
+3. Press arrow key to move to next block
+
+### Undo / Redo
+- **Ctrl+Z** = Undo last action (label, abstain, clear, edit)
+- **Ctrl+Shift+Z** = Redo
+
+### Clear a block
+- **Backspace / Delete** = Clear current block back to unlabeled
+
+### Help
+- **?** = Show keybinding cheat-sheet (future implementation)
+
+## Persistence & Resume
+
+Every labeling action triggers autosave checks:
+- **By label count**: every `autosave.every_n_labels` actions (default 25)
+- **By time**: every `autosave.every_seconds` seconds (default 30)
+
+When you reopen an observation:
+- Session resumes at last cursor position
+- All labels restored from Parquet
+- Warning if `classes.yaml` changed since last session
+
+## Export & Training
+
+### Export labeled blocks as probe set
+```bash
+python3 scripts/export_labels.py /path/to/file.jp2 labels/OBS_ID.parquet \
+  -o probe_set/
+```
+
+Generates:
+- `crops/` — PNG images (one per labeled block)
+- `labels.csv` — Block coordinates and class IDs
+- `classes.json` — Class metadata
+
+### Export to GeoTIFF
+Done automatically on exit (future: manual export button). Produces coarse-grid GeoTIFF aligned to source CRS, ready for QGIS.
+
+## Configuration
+
+### `configs/app.yaml` — App behavior
+```yaml
+geometry:
+  panel_size: 4096      # Panel display size
+  block_size: 512       # Block label unit
+
+navigation:
+  advance_mode: next_unlabeled  # or next_sequential
+  advance_on_edit: false        # No auto-advance when editing
+
+skip:
+  nodata_skip_threshold: 0.5    # Auto-skip if >50% nodata
+  variance_skip_threshold: 0.0  # Disabled by default
+
+autosave:
+  every_n_labels: 25
+  every_seconds: 30
+```
+
+### `configs/classes.yaml` — Terrain legend
+Each class has: `id` (never renumber), `name`, `color` (hex), `hotkey` (single char).
+
+## Command-line Tools
+
+### Build overviews (for large JP2s)
+```bash
+python3 scripts/build_overviews.py /path/to/file.jp2
+```
+
+Significantly speeds up panel loading by building GDAL overviews.
+
+### Export probe set
+```bash
+python3 scripts/export_labels.py file.jp2 labels/OBS.parquet -o probe_set/
+```
+
+## Acceptance Checklist
+
+- ✅ Loads a 2 GB JP2 and displays without loading fully into RAM
+- ✅ Legend shows each class's color, name, hotkey
+- ✅ Panel canvas shows block grid overlay on imagery
+- ✅ One keypress = label block, auto-advance (or abstain)
+- ✅ Arrow keys move; labeled blocks can be reclassified
+- ✅ Finishing a panel → jumps to next; history supports panel jumps
+- ✅ Block/panel sizes are config values; class scheme is config-driven
+- ✅ Labels persist (Parquet) with metadata; resume works; GeoTIFF exports aligned
+- ✅ Entire workflow keyboard-only (no mouse required for labeling)
 
 ## Project Structure
 
