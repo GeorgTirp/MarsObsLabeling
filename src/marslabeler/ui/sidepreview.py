@@ -11,10 +11,12 @@ from marslabeler.ui.render import numpy_to_qimage, apply_display_stretch
 class SidePreview(QWidget):
     """Displays the current block at native 1:1 resolution."""
 
+    PREVIEW_SIZE = 480  # square preview box, matches square blocks (e.g. 512×512)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMaximumWidth(550)
-        self.setMinimumWidth(300)
+        self.setMinimumWidth(self.PREVIEW_SIZE + 30)
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -24,11 +26,12 @@ class SidePreview(QWidget):
         title.setStyleSheet("font-weight: bold; padding: 4px;")
         layout.addWidget(title)
 
-        # Image display (scrollable if large)
+        # Image display — fixed square box so the crop reads as a true square
         self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setFixedSize(self.PREVIEW_SIZE, self.PREVIEW_SIZE)
         self.image_label.setStyleSheet("background-color: #1a1a1a; border: 1px solid #444;")
-        layout.addWidget(self.image_label)
+        layout.addWidget(self.image_label, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         # Info label
         self.info_label = QLabel()
@@ -47,6 +50,7 @@ class SidePreview(QWidget):
         """
         if block_data.size == 0:
             self.image_label.clear()
+            self.image_label.setText("(empty)")
             self.info_label.setText("(empty)")
             return
 
@@ -56,10 +60,14 @@ class SidePreview(QWidget):
         # Convert to QImage
         qimage = numpy_to_qimage(stretched)
 
-        # Scale to fit (max 500px, maintain aspect)
-        max_size = 480
-        if qimage.width() > max_size or qimage.height() > max_size:
-            qimage = qimage.scaledToWidth(max_size, Qt.TransformationMode.FastTransformation)
+        # Scale to fit the square preview box, keeping aspect ratio.
+        # Full blocks (512×512) fill the box; partial edge blocks letterbox cleanly.
+        qimage = qimage.scaled(
+            self.PREVIEW_SIZE,
+            self.PREVIEW_SIZE,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
 
         pixmap = QPixmap.fromImage(qimage)
         self.image_label.setPixmap(pixmap)

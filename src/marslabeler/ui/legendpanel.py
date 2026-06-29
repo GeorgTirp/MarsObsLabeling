@@ -57,28 +57,39 @@ class LegendPanel(QWidget):
     def _create_class_item(self, class_obj) -> QWidget:
         """Create a visual item for a class."""
         frame = QFrame()
-        frame.setStyleSheet("QFrame { background-color: #2a2a2a; border: 1px solid #444; border-radius: 2px; }")
+        frame.setStyleSheet(
+            "QFrame { "
+            "background-color: #1a1a1a; "
+            "border: 1px solid #555; "
+            "border-radius: 4px; "
+            "padding: 4px; "
+            "}"
+        )
         layout = QGridLayout()
-        layout.setSpacing(4)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+        layout.setContentsMargins(6, 6, 6, 6)
         frame.setLayout(layout)
 
-        # Color swatch
+        # Color swatch (larger)
         swatch = QLabel()
-        pixmap = QPixmap(24, 24)
+        pixmap = QPixmap(32, 32)
         pixmap.fill(QColor(class_obj.color))
         swatch.setPixmap(pixmap)
+        swatch.setStyleSheet("border: 1px solid #666; border-radius: 2px;")
         layout.addWidget(swatch, 0, 0, 2, 1)
 
         # Class name
         name_label = QLabel(class_obj.name)
-        name_label.setStyleSheet("font-weight: bold;")
+        name_label.setStyleSheet("font-weight: bold; font-size: 11px; color: #ffffff;")
         layout.addWidget(name_label, 0, 1)
 
-        # Hotkey
+        # Hotkey (more prominent)
         if class_obj.hotkey:
-            key_label = QLabel(f"[{class_obj.hotkey}]")
-            key_label.setStyleSheet("font-size: 10px; color: #aaa;")
+            key_label = QLabel(f"Press <b>{class_obj.hotkey}</b>")
+            key_label.setStyleSheet("font-size: 10px; color: #8AB4F8; font-weight: bold;")
+            layout.addWidget(key_label, 1, 1)
+        else:
+            key_label = QLabel("")
             layout.addWidget(key_label, 1, 1)
 
         return frame

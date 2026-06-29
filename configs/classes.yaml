@@ -2,14 +2,9 @@
 # id MUST be a stable small int >= 0; never renumber existing ids.
 # hotkey: a single character; must be unique across classes.
 classes:
-  - { id: 0,  name: "Smooth bedrock",    color: "#4C72B0", hotkey: "q" }
-  - { id: 1,  name: "Fractured bedrock", color: "#DD8452", hotkey: "w" }
-  - { id: 2,  name: "Boulder field",     color: "#55A868", hotkey: "e" }
-  - { id: 3,  name: "Ripples/TARs",      color: "#C44E52", hotkey: "r" }
-  - { id: 4,  name: "Sand sheet",        color: "#8172B3", hotkey: "a" }
-  - { id: 5,  name: "Dust/mantled",      color: "#937860", hotkey: "s" }
-  - { id: 6,  name: "Crater interior",   color: "#DA8BC3", hotkey: "d" }
-  - { id: 7,  name: "Slope/scarp",       color: "#8C8C8C", hotkey: "f" }
+  - { id: 0,  name: "Bedrock",     color: "#4C72B0", hotkey: "q" }
+  - { id: 1,  name: "Sand",        color: "#D4A574", hotkey: "w" }
+  - { id: 2,  name: "Not Available", color: "#808080", hotkey: "e" }
 
 # Reserved, not user-assignable via class hotkeys:
 abstain:

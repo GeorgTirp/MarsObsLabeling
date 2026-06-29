@@ -21,6 +21,8 @@ class KeyboardController:
         self.on_panel_changed: Optional[Callable[[], None]] = None
         self.on_cursor_changed: Optional[Callable[[], None]] = None
         self.on_show_help: Optional[Callable[[], None]] = None
+        # Explicit "advance to next panel" intent (button / PageDown) — NA-fills on leave
+        self.on_next_panel: Optional[Callable[[], None]] = None
 
         # Track last action for autosave
         self.last_action_type = None
@@ -68,7 +70,13 @@ class KeyboardController:
 
         # Class hotkeys
         else:
-            class_id = self.classes_scheme.hotkey_to_id.get(text)
+            # The spacebar produces a " " character, but the config stores the
+            # abstain hotkey as the readable token "space" — normalize so both match.
+            lookup_key = text
+            if key == Qt.Key.Key_Space or text == " ":
+                lookup_key = "space"
+
+            class_id = self.classes_scheme.hotkey_to_id.get(lookup_key)
             if class_id is not None:
                 if class_id == -1:  # Abstain
                     return self._handle_abstain()
@@ -80,11 +88,8 @@ class KeyboardController:
     def _handle_label_class(self, class_id: int) -> bool:
         """Label current block with class and auto-advance."""
         block = self.session.current_block()
+        panel_before = block.panel_idx
         class_name = self.classes_scheme.get_name(class_id)
-
-        # Check if this is an edit (block already labeled)
-        record = self.session.labels.get_record(block.block_id)
-        is_edit = record.status in ("labeled", "abstain")
 
         self.session.label_current_block(class_id, class_name)
         self.last_action_type = "label"
@@ -92,8 +97,8 @@ class KeyboardController:
         if self.on_label_changed:
             self.on_label_changed()
 
-        # If this causes panel rollover, notify panel change
-        if self.session.current_block().panel_idx != self.session.current_panel_idx:
+        # If auto-advance rolled into a different panel, notify panel change
+        if self.session.current_block().panel_idx != panel_before:
             if self.on_panel_changed:
                 self.on_panel_changed()
 
@@ -101,6 +106,7 @@ class KeyboardController:
 
     def _handle_abstain(self) -> bool:
         """Abstain on current block and auto-advance."""
+        panel_before = self.session.current_block().panel_idx
         self.session.abstain_current_block()
         self.last_action_type = "abstain"
 
@@ -108,7 +114,7 @@ class KeyboardController:
             self.on_label_changed()
 
         # Check for panel rollover
-        if self.session.current_block().panel_idx != self.session.current_panel_idx:
+        if self.session.current_block().panel_idx != panel_before:
             if self.on_panel_changed:
                 self.on_panel_changed()
 
@@ -159,10 +165,13 @@ class KeyboardController:
         return True
 
     def _handle_next_panel(self) -> bool:
-        """Jump to next panel."""
-        self.session.move_to_next_panel()
-        if self.on_panel_changed:
-            self.on_panel_changed()
+        """Jump to next panel (explicit forward intent → NA-fills the panel left behind)."""
+        if self.on_next_panel:
+            self.on_next_panel()
+        else:
+            self.session.move_to_next_panel()
+            if self.on_panel_changed:
+                self.on_panel_changed()
         return True
 
     def _handle_previous_panel(self) -> bool:

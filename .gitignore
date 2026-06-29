@@ -1,0 +1,41 @@
+# ---- Virtual environments ----
+venv/
+.venv/
+env/
+ENV/
+
+# ---- Data (large rasters, not version-controlled) ----
+*.JP2
+*.jp2
+*.tif
+*.tiff
+*.img
+*.ovr          # GDAL overviews
+*.aux.xml
+
+# ---- Output (labels, sessions, exports) ----
+labels/
+configs/labels/
+exports/
+*.parquet
+*.session.json
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- Editor / OS ----
+.DS_Store
+.idea/
+.vscode/
+*.swp

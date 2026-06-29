@@ -1,5 +1,5 @@
 paths:
-  classes_file: configs/classes.yaml
+  classes_file: classes.yaml
   labels_dir: ./labels
 
 geometry:

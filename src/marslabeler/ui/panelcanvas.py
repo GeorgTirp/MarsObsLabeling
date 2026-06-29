@@ -110,7 +110,7 @@ class PanelCanvas(QGraphicsView):
             self.block_height,
             block_data,
             class_colors,
-            alpha=0.4,
+            alpha=0.25,
         )
 
         if self.label_overlay_item is None:

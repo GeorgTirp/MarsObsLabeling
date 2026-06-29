@@ -161,6 +161,30 @@ class LabelStore:
         # Clear redo stack on new action
         self.redo_stack.clear()
 
+    def bulk_assign(self, block_ids: list[str], class_id: int, class_name: str) -> int:
+        """
+        Assign the same class to many blocks with a single undo snapshot.
+
+        Used for "fill remaining unlabeled blocks as NA" on panel completion.
+        Returns the number of blocks actually changed.
+        """
+        targets = [bid for bid in block_ids if bid in self.records]
+        if not targets:
+            return 0
+
+        self._save_undo_state()
+        now = int(time.time() * 1000)
+        status = "labeled" if class_id >= 0 else "abstain"
+        for block_id in targets:
+            record = self.records[block_id]
+            record.class_id = class_id
+            record.class_name = class_name
+            record.status = status
+            record.updated_utc = now
+            record.edit_count += 1
+        self.redo_stack.clear()
+        return len(targets)
+
     def set_nodata(self, block_id: str) -> None:
         """Mark a block as nodata."""
         if block_id not in self.records:
