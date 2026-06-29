@@ -10,8 +10,8 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QFrame,
     QGridLayout,
+    QProgressBar,
 )
-from PySide6.QtGui import QProgressBar
 
 from marslabeler.model.grid import Grid
 from marslabeler.model.labelstore import LabelStore

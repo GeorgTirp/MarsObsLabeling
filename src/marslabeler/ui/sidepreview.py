@@ -2,8 +2,8 @@
 
 import numpy as np
 from PySide6.QtCore import Qt, QSize
-from PySide6.QtGui import QPixmap, QLabel
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel as QLabelWidget
+from PySide6.QtGui import QPixmap
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
 from marslabeler.ui.render import numpy_to_qimage, apply_display_stretch
 
@@ -20,18 +20,18 @@ class SidePreview(QWidget):
         self.setLayout(layout)
 
         # Title
-        title = QLabelWidget("Block Preview (1:1)")
+        title = QLabel("Block Preview (1:1)")
         title.setStyleSheet("font-weight: bold; padding: 4px;")
         layout.addWidget(title)
 
         # Image display (scrollable if large)
-        self.image_label = QLabelWidget()
+        self.image_label = QLabel()
         self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.image_label.setStyleSheet("background-color: #1a1a1a; border: 1px solid #444;")
         layout.addWidget(self.image_label)
 
         # Info label
-        self.info_label = QLabelWidget()
+        self.info_label = QLabel()
         self.info_label.setStyleSheet("font-size: 10px; color: #aaa; padding: 4px;")
         layout.addWidget(self.info_label)
 
