@@ -17,6 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",
+    "pytest-qt>=4.2",
     "ruff>=0.1.0",
     "black>=23.0",
     "mypy>=1.0",
@@ -24,7 +25,6 @@ dev = [
 
 gui = [
     "PySide6>=6.0",
-    "pytest-qt>=4.2",
 ]
 
 [project.scripts]

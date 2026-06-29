@@ -30,11 +30,20 @@ def main():
 
     args = parser.parse_args()
 
-    # TODO: Launch the GUI (after M3)
-    print("Mars Obs Labeler v0.1.0")
+    # Launch GUI
+    from PySide6.QtWidgets import QApplication
+    from marslabeler.ui.mainwindow import MainWindow
+
+    app = QApplication(sys.argv)
+
+    config_path = Path(args.config) if args.config else Path("configs/app.yaml")
+    window = MainWindow(config_path)
+    window.show()
+
     if args.jp2_path:
-        print(f"Will open: {args.jp2_path}")
-    print("(GUI not yet implemented)")
+        window._load_observation(Path(args.jp2_path))
+
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
