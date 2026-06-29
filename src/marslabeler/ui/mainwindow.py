@@ -67,6 +67,10 @@ class MainWindow(QMainWindow):
         self.last_class_id: Optional[int] = None
         # Active marquee selection (r0, c0, r1, c1) awaiting a class key to fill
         self.selection_rect: Optional[tuple[int, int, int, int]] = None
+        # View mode: "panel" (single, labelable) | "multi" (NxN panels) | "overview" (whole image)
+        self.view_mode = "panel"
+        self.multi_span = 2  # panels per side in "multi" mode (2 or 4)
+        self._multi_origin = (0, 0)  # (panel_row0, panel_col0) of the multi region
 
         # UI Components
         self._setup_ui()
@@ -110,6 +114,12 @@ class MainWindow(QMainWindow):
         right_layout.addStretch()
 
         # Action buttons (disabled until a session loads)
+        self.overview_button = QPushButton("Overview (O)  ⤢")
+        self.overview_button.setEnabled(False)
+        self.overview_button.setCheckable(True)
+        self.overview_button.clicked.connect(self._toggle_overview)
+        right_layout.addWidget(self.overview_button)
+
         self.next_panel_button = QPushButton("Next Panel ▶  (fills rest as NA)")
         self.next_panel_button.setEnabled(False)
         self.next_panel_button.clicked.connect(self._go_to_next_panel)
@@ -250,6 +260,7 @@ class MainWindow(QMainWindow):
             self.next_panel_button.setEnabled(True)
             self.export_button.setEnabled(True)
             self.export_action.setEnabled(True)
+            self.overview_button.setEnabled(True)
             self.saved_complete_panels = set()
 
             self.status_label.setText(f"Loaded: {jp2_path.stem}")
@@ -287,10 +298,11 @@ class MainWindow(QMainWindow):
         self._clear_selection()
         self.status_label.setText(f"Loading panel {self.current_panel_idx}...")
 
-        # Synchronous decimated read — fast via GDAL overviews, no thread to crash
+        # Synchronous decimated read at the current zoom resolution (fast via GDAL)
         grid = self.session.grid
         x, y, w, h = grid.get_panel_coords(self.current_panel_idx)
-        panel_data = self.session.raster.read_window(x, y, w, h, 1600, 1600)
+        out = self.canvas.canvas_width  # 1600 at zoom 1, larger when zoomed in
+        panel_data = self.session.raster.read_window(x, y, w, h, out, out)
         self._render_panel(panel_data)
 
     def _render_panel(self, panel_data: np.ndarray):
@@ -311,6 +323,9 @@ class MainWindow(QMainWindow):
         # Set current block highlight
         current_block = self.session.current_block()
         self.canvas.set_current_block_highlight(current_block.block_row, current_block.block_col)
+
+        # Apply fit (zoom 1) or magnified view centered on the current block (zoom > 1)
+        self.canvas.apply_zoom_view()
 
         # Load side preview
         block_data_native = self.session.raster.read_window(
@@ -337,13 +352,34 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(100, self._show_help)
 
     def _on_block_clicked(self, block_row: int, block_col: int):
-        """Plain click: move the cursor to the block and set it as the rectangle anchor."""
+        """Click handling depends on the active view mode."""
         if not self.session:
             return
 
-        # A plain click cancels any pending marquee selection
-        self._clear_selection()
+        if self.view_mode == "overview":
+            # Cell = panel → open it (skip hidden empty panels)
+            panel_idx = block_row * self.session.grid.panels_across + block_col
+            if panel_idx < self.session.grid.num_panels and panel_idx not in self.empty_panels:
+                self._enter_panel(panel_idx)
+            return
 
+        if self.view_mode == "multi":
+            # Cell = block in the region → move the cursor there (stay zoomed out)
+            grid = self.session.grid
+            pr0, pc0 = self._multi_origin
+            idx = self._global_block_to_idx(
+                pr0 * grid.blocks_per_panel_row + block_row,
+                pc0 * grid.blocks_per_panel_col + block_col,
+            )
+            if idx is not None:
+                self.session.move_to_block(idx)
+                self.current_panel_idx = self.session.current_block().panel_idx
+                self.canvas.set_current_block_highlight(block_row, block_col)
+                self._update_preview()
+            return
+
+        # Single-panel mode: navigate to the clicked block
+        self._clear_selection()  # a plain click cancels any pending marquee selection
         grid = self.session.grid
         panel_blocks = grid.get_panel_blocks(self.current_panel_idx)
         local_idx = block_row * grid.blocks_per_panel_col + block_col
@@ -361,9 +397,8 @@ class MainWindow(QMainWindow):
         """
         if not self.session:
             return
-        self.session.move_to_panel(panel_idx)  # cursor → first block of that panel
-        self._load_current_panel()             # re-syncs current_panel_idx from cursor
-        self._refresh_history()
+        # Clicking a panel in the history always opens it in single-panel mode
+        self._enter_panel(panel_idx)
 
     # ------------------------------------------------------------------ #
     # Region labeling: drag-paint brush + Shift+click rectangle
@@ -414,7 +449,7 @@ class MainWindow(QMainWindow):
 
     def _on_block_paint(self, block_row: int, block_col: int, is_start: bool) -> None:
         """Drag-paint: label the block under the cursor with the held class brush."""
-        if self.held_class_id is None or not self.session:
+        if self.held_class_id is None or not self.session or self.view_mode != "panel":
             return
         block = self._panel_block_map().get((block_row, block_col))
         if block is None:
@@ -437,6 +472,9 @@ class MainWindow(QMainWindow):
 
     def _on_selection_made(self, r0: int, c0: int, r1: int, c1: int) -> None:
         """A Shift+drag marquee was completed — remember it and await a class key."""
+        if self.view_mode != "panel":
+            self.canvas.clear_selection()
+            return
         self.selection_rect = (r0, c0, r1, c1)
         n = (r1 - r0 + 1) * (c1 - c0 + 1)
         self.status_label.setText(
@@ -479,6 +517,28 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
             return
 
+        if not event.isAutoRepeat():
+            # Zoom ladder: in-panel magnify ↔ multi-panel zoom-out ↔ overview
+            if event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+                self._zoom_in()
+                return
+            if event.key() in (Qt.Key.Key_Minus, Qt.Key.Key_Underscore):
+                self._zoom_out()
+                return
+            # 'O' toggles the whole-image overview
+            if event.key() == Qt.Key.Key_O:
+                self._toggle_overview()
+                return
+            # Esc leaves a zoomed-out view back to the single panel
+            if event.key() == Qt.Key.Key_Escape and self.view_mode != "panel":
+                self._set_view("panel")
+                return
+
+        # Overview is navigation-only: ignore labeling/navigation keys
+        if self.view_mode == "overview":
+            super().keyPressEvent(event)
+            return
+
         # If a marquee selection is active, a class key fills it (Esc cancels it)
         if self.selection_rect is not None and not event.isAutoRepeat():
             if event.key() == Qt.Key.Key_Escape:
@@ -516,36 +576,228 @@ class MainWindow(QMainWindow):
             self.loading_overlay.setGeometry(self.rect())
 
     def _on_labels_changed(self) -> None:
-        """Callback: labels have changed, refresh UI."""
+        """Callback: labels have changed, refresh the active view."""
         prev_panel = self.current_panel_idx  # panel the just-labeled block was in
-        self._load_current_panel()  # reloads + re-syncs current_panel_idx to the cursor
+        self._refresh_view()  # panel mode re-syncs current_panel_idx to the cursor
         self._refresh_history()
         # If that panel is now fully done (e.g. last block labeled), autosave it
         self._maybe_save_completed_panel(prev_panel)
 
     def _on_panel_changed_kb(self) -> None:
         """Callback: cursor rolled into another panel (auto-advance / PageUp). Just redraw."""
-        self._load_current_panel()
+        self._refresh_view()
         self._refresh_history()
 
     def _on_cursor_changed(self) -> None:
-        """Callback: cursor moved, update preview only."""
+        """Callback: cursor moved (no label change)."""
         if not self.session:
+            return
+
+        # In multi mode the highlight is region-relative and the view follows the cursor
+        if self.view_mode == "multi":
+            self._render_multi(self.multi_span)
+            return
+        if self.view_mode == "overview":
             return
 
         current_block = self.session.current_block()
         self.canvas.set_current_block_highlight(current_block.block_row, current_block.block_col)
+        # Keep the current block in view when zoomed in
+        self.canvas.recenter_current()
+        self._update_preview()
 
-        # Update preview
-        block_data_native = self.session.raster.read_window(
-            current_block.x_px,
-            current_block.y_px,
-            current_block.w_px,
-            current_block.h_px,
-            current_block.w_px,
-            current_block.h_px,
+    # Detail buffer cap when zoomed in (px). ~near-native for a 4096 panel,
+    # ~10 MB — stays constant no matter how far you zoom (magnification is view-only).
+    DETAIL_BUFFER = 3200
+
+    def _set_zoom(self, zoom: int) -> None:
+        """Set panel zoom (1,2,4,8,16,32). Buffer is capped, so memory stays constant."""
+        zoom = max(1, min(32, zoom))
+        if not self.session or zoom == self.canvas.zoom:
+            return
+
+        old_buffer = self.canvas.canvas_width
+        # Zoom 1 uses the fast 1600 buffer; any zoom-in uses one capped detail buffer
+        new_buffer = (
+            self.canvas.base_size
+            if zoom == 1
+            else min(self.session.grid.panel_size, self.DETAIL_BUFFER)
         )
-        self.preview.set_block_image(block_data_native, current_block.block_id)
+
+        self.canvas.zoom = zoom
+        if new_buffer != old_buffer:
+            # Buffer resolution changed (crossing 1 ↔ zoomed) — re-read the panel once
+            self.canvas.canvas_width = new_buffer
+            self.canvas.canvas_height = new_buffer
+            self._load_current_panel()
+        else:
+            # Same buffer (e.g. 2→4→8…) — just re-scale the view, no re-read
+            self.canvas.apply_zoom_view()
+
+        self.status_label.setText(f"Zoom {zoom}×")
+
+    # ------------------------------------------------------------------ #
+    # View modes: single panel / multi-panel zoom-out / whole-image overview
+    # ------------------------------------------------------------------ #
+
+    DONE_PANEL_TINT = -100  # pseudo class id used to tint completed panels in overview
+
+    def _refresh_view(self) -> None:
+        """Re-render whatever view is active (panel / multi / overview)."""
+        if not self.session:
+            return
+        if self.view_mode == "overview":
+            self._render_overview()
+        elif self.view_mode == "multi":
+            self._render_multi(self.multi_span)
+        else:
+            self._load_current_panel()
+
+    def _set_view(self, mode: str, span: int = 2) -> None:
+        """Switch view mode and re-render. Resets zoom + selection."""
+        if not self.session:
+            return
+        self.view_mode = mode
+        self.canvas.zoom = 1
+        self._clear_selection()
+        self.overview_button.setChecked(mode == "overview")
+        if mode == "panel":
+            self.canvas.canvas_width = self.canvas.base_size
+            self.canvas.canvas_height = self.canvas.base_size
+        elif mode == "multi":
+            self.multi_span = span
+        self._refresh_view()
+
+    def _toggle_overview(self) -> None:
+        """Overview button / 'O': toggle whole-image overview vs single panel."""
+        self._set_view("panel" if self.view_mode == "overview" else "overview")
+
+    def _enter_panel(self, panel_idx: int) -> None:
+        """Jump into a panel in single-panel mode (from overview/multi click)."""
+        self.session.move_to_panel(panel_idx)
+        self._set_view("panel")
+        self._refresh_history()
+
+    def _zoom_in(self) -> None:
+        """'+': magnify within a panel, or step the zoom-out ladder back in."""
+        if self.view_mode == "overview":
+            self._set_view("multi", span=4)
+        elif self.view_mode == "multi":
+            self._set_view("multi", span=2) if self.multi_span > 2 else self._set_view("panel")
+        else:
+            self._set_zoom(self.canvas.zoom * 2)
+
+    def _zoom_out(self) -> None:
+        """'-': zoom out within a panel, then out to multi-panel, then overview."""
+        if self.view_mode == "panel":
+            if self.canvas.zoom > 1:
+                self._set_zoom(self.canvas.zoom // 2)
+            else:
+                self._set_view("multi", span=2)
+        elif self.view_mode == "multi":
+            self._set_view("multi", span=4) if self.multi_span < 4 else self._set_view("overview")
+        # overview is the maximum zoom-out
+
+    def _render_overview(self) -> None:
+        """Whole-image overview: panels as cells, current highlighted, done tinted green."""
+        grid = self.session.grid
+        pa, pd = grid.panels_across, grid.panels_down
+        cell = 200
+        self.canvas.zoom = 1
+        self.canvas.canvas_width = pa * cell
+        self.canvas.canvas_height = pd * cell
+
+        img = self.session.raster.read_window_padded(
+            0, 0, pa * grid.panel_size, pd * grid.panel_size,
+            self.canvas.canvas_width, self.canvas.canvas_height,
+        )
+        self.canvas.set_panel_image(img, stretch_percentiles=(1, 99))
+        self.canvas.set_grid(pa, pd)
+
+        cell_data = np.full((pd, pa), -3, dtype=np.int16)
+        for p in range(grid.num_panels):
+            pr, pc = divmod(p, pa)
+            if self._panel_complete(p):
+                cell_data[pr, pc] = self.DONE_PANEL_TINT
+        self.canvas.set_label_overlay(cell_data, {self.DONE_PANEL_TINT: "#4CAF50"})
+
+        cur_pr, cur_pc = divmod(self.current_panel_idx, pa)
+        self.canvas.set_current_block_highlight(cur_pr, cur_pc)
+        self.canvas.apply_zoom_view()
+        self.status_label.setText("Overview — click a panel to open it, O or Esc to go back")
+
+    def _render_multi(self, span: int) -> None:
+        """Zoom-out showing span×span panels around the current one (black-padded)."""
+        grid = self.session.grid
+        pa, pd = grid.panels_across, grid.panels_down
+        bppr, bppc = grid.blocks_per_panel_row, grid.blocks_per_panel_col
+        self.current_panel_idx = self.session.current_block().panel_idx
+        cur_pr, cur_pc = divmod(self.current_panel_idx, pa)
+
+        # Span-aligned region origin (in panels) containing the current panel
+        pr0 = (cur_pr // span) * span
+        pc0 = (cur_pc // span) * span
+        self._multi_origin = (pr0, pc0)
+
+        buf = self.canvas.base_size
+        self.canvas.zoom = 1
+        self.canvas.canvas_width = buf
+        self.canvas.canvas_height = buf
+        img = self.session.raster.read_window_padded(
+            pc0 * grid.panel_size, pr0 * grid.panel_size,
+            span * grid.panel_size, span * grid.panel_size, buf, buf,
+        )
+        self.canvas.set_panel_image(img, stretch_percentiles=(1, 99))
+
+        rows, cols = span * bppr, span * bppc
+        self.canvas.set_grid(cols, rows)
+
+        cell_data = np.full((rows, cols), -3, dtype=np.int16)
+        for r in range(rows):
+            for c in range(cols):
+                idx = self._global_block_to_idx(pr0 * bppr + r, pc0 * bppc + c)
+                if idx is not None:
+                    block = grid.get_block(idx)
+                    cell_data[r, c] = self.session.labels.get_record(block.block_id).class_id
+        self.canvas.set_label_overlay(cell_data, self._class_colors())
+
+        cb = self.session.current_block()
+        self.canvas.set_current_block_highlight(
+            cur_pr * bppr + cb.block_row - pr0 * bppr,
+            cur_pc * bppc + cb.block_col - pc0 * bppc,
+        )
+        self.canvas.apply_zoom_view()
+        self._update_preview()
+        self.status_label.setText(
+            f"Zoom out {span}×{span} panels — click a block, label with q/w/e, +/- to zoom"
+        )
+
+    def _global_block_to_idx(self, global_block_row: int, global_block_col: int):
+        """Map a global (block_row, block_col) across the whole image to a block index."""
+        grid = self.session.grid
+        pa, pd = grid.panels_across, grid.panels_down
+        bppr, bppc = grid.blocks_per_panel_row, grid.blocks_per_panel_col
+        if global_block_row < 0 or global_block_col < 0:
+            return None
+        if global_block_row >= pd * bppr or global_block_col >= pa * bppc:
+            return None
+        panel_row, lbr = divmod(global_block_row, bppr)
+        panel_col, lbc = divmod(global_block_col, bppc)
+        panel_idx = panel_row * pa + panel_col
+        if panel_idx >= grid.num_panels:
+            return None
+        idx = panel_idx * grid.blocks_per_panel + lbr * bppc + lbc
+        return idx if idx < grid.num_blocks() else None
+
+    def _update_preview(self) -> None:
+        """Refresh the side preview from the current block."""
+        if not self.session:
+            return
+        cb = self.session.current_block()
+        data = self.session.raster.read_window(
+            cb.x_px, cb.y_px, cb.w_px, cb.h_px, cb.w_px, cb.h_px
+        )
+        self.preview.set_block_image(data, cb.block_id)
 
     def _setup_autosave(self) -> None:
         """Setup autosave timer."""

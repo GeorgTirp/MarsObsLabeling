@@ -33,12 +33,15 @@ class PanelCanvas(QGraphicsView):
         self.selection_item: Optional[QGraphicsRectItem] = None
 
         # Current state
-        self.canvas_width = 1600
-        self.canvas_height = 1600
+        self.base_size = 1600          # render size at zoom 1 (whole panel fits the view)
+        self.zoom = 1                  # 1, 2, 4 — render resolution multiplier
+        self.canvas_width = self.base_size
+        self.canvas_height = self.base_size
         self.block_width = 200  # Will be updated
         self.block_height = 200  # Will be updated
         self.blocks_per_row = 8
         self.blocks_per_col = 8
+        self._current_rc: Optional[tuple[int, int]] = None  # current block, for centering
 
         # Interaction callbacks
         self.on_block_clicked: Optional[Callable[[int, int], None]] = None
@@ -79,8 +82,7 @@ class PanelCanvas(QGraphicsView):
             self.image_item = self.scene.addPixmap(pixmap)
         else:
             self.image_item.setPixmap(pixmap)
-
-        self._update_view_size()
+        # View fit/zoom is applied by the caller once all layers are rebuilt
 
     def set_grid(self, blocks_per_row: int, blocks_per_col: int) -> None:
         """
@@ -138,6 +140,7 @@ class PanelCanvas(QGraphicsView):
         Args:
             block_row, block_col: Current block position in grid
         """
+        self._current_rc = (block_row, block_col)
         highlight_pixmap = create_current_block_highlight(
             self.canvas_width,
             self.canvas_height,
@@ -154,9 +157,31 @@ class PanelCanvas(QGraphicsView):
         else:
             self.highlight_item.setPixmap(highlight_pixmap)
 
-    def _update_view_size(self) -> None:
-        """Update view to fit scene."""
-        self.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+    def apply_zoom_view(self) -> None:
+        """Fit the whole panel at zoom 1; magnify + center on the current block when zoomed.
+
+        The scene (a fixed-size buffer) is magnified purely by the view transform, so the
+        apparent panel size is `zoom`x the zoom-1 fit regardless of the buffer resolution —
+        memory stays constant as zoom increases.
+        """
+        self.resetTransform()
+        rect = self.scene.itemsBoundingRect()
+        vp = self.viewport().rect()
+        if self.zoom <= 1 or vp.width() <= 0 or vp.height() <= 0:
+            self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+            return
+        vp_min = min(vp.width(), vp.height())
+        view_scale = self.zoom * vp_min / self.canvas_width
+        self.scale(view_scale, view_scale)
+        if self._current_rc is not None:
+            r, c = self._current_rc
+            self.centerOn((c + 0.5) * self.block_width, (r + 0.5) * self.block_height)
+
+    def recenter_current(self) -> None:
+        """Re-center the (zoomed) view on the current block without rebuilding."""
+        if self.zoom > 1 and self._current_rc is not None:
+            r, c = self._current_rc
+            self.centerOn((c + 0.5) * self.block_width, (r + 0.5) * self.block_height)
 
     def _block_at(self, pos) -> tuple[int, int]:
         """Map a widget position to a (block_row, block_col), clamped to the grid."""
@@ -245,7 +270,7 @@ class PanelCanvas(QGraphicsView):
             self.on_block_paint_end()
 
     def resizeEvent(self, event) -> None:
-        """Handle resize to maintain fit."""
+        """Handle resize to maintain the current fit/zoom."""
         super().resizeEvent(event)
         if self.scene and self.scene.items():
-            self.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
+            self.apply_zoom_view()

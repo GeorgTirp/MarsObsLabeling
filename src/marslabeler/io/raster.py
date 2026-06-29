@@ -117,6 +117,44 @@ class RasterSource:
         data = self._dataset.read(1, window=window, out_shape=(out_height, out_width))
         return np.asarray(data, dtype=data.dtype)
 
+    def read_window_padded(
+        self, x: int, y: int, width: int, height: int, out_width: int, out_height: int
+    ) -> np.ndarray:
+        """
+        Like read_window, but the requested region may extend beyond the image.
+
+        Areas outside the image are padded with black (0) — used by the zoomed-out
+        / overview views so you can pan past the swath edges.
+
+        Returns:
+            np.ndarray of shape (out_height, out_width), valid data placed proportionally.
+        """
+        if self._dataset is None:
+            raise RuntimeError("Raster not open")
+
+        # Intersection of the requested region with the image bounds
+        ix0 = max(0, x)
+        iy0 = max(0, y)
+        ix1 = min(self.width, x + width)
+        iy1 = min(self.height, y + height)
+
+        if ix1 <= ix0 or iy1 <= iy0:
+            # Entirely outside the image
+            return np.zeros((out_height, out_width), dtype=np.uint8)
+
+        # Where the valid sub-region maps in the output buffer
+        sx = out_width / width
+        sy = out_height / height
+        ox0 = int(round((ix0 - x) * sx))
+        oy0 = int(round((iy0 - y) * sy))
+        ow = max(1, min(out_width - ox0, int(round((ix1 - ix0) * sx))))
+        oh = max(1, min(out_height - oy0, int(round((iy1 - iy0) * sy))))
+
+        data = self.read_window(ix0, iy0, ix1 - ix0, iy1 - iy0, ow, oh)
+        out = np.zeros((out_height, out_width), dtype=data.dtype)
+        out[oy0:oy0 + oh, ox0:ox0 + ow] = data[:oh, :ow]
+        return out
+
     def nodata_fraction(self, x: int, y: int, width: int, height: int) -> float:
         """
         Estimate nodata fraction in a window using a decimated read.
