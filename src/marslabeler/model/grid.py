@@ -38,6 +38,7 @@ class Grid:
         block_size: int,
         obs_id: str,
         transform: Affine,
+        crs: Optional[str] = None,
     ):
         self.img_width = img_width
         self.img_height = img_height
@@ -45,6 +46,7 @@ class Grid:
         self.block_size = block_size
         self.obs_id = obs_id
         self.transform = transform
+        self.crs = crs
 
         # Validate constraints
         if block_size % 32 != 0:

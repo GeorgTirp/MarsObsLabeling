@@ -83,9 +83,15 @@ mars-labeler/
 
 **DoD:** 43 passing tests covering config validation, class scheme, raster reading, and grid geometry.
 
-### 📋 M2 — Label store, session, persistence, export
+### ✅ M2 — Label store, session, persistence, export (COMPLETE)
 
-Builds the data model for label storage and the session management logic that ties everything together.
+**Components:**
+- `model/labelstore.py`: In-memory label state, Parquet persistence, undo/redo stack
+- `model/session.py`: Ties RasterSource + Grid + LabelStore; navigation logic (auto-advance, next-unlabeled, panel rollover)
+- `model/export.py`: GeoTIFF export with correct geotransform, class metadata export
+- Session persistence: Parquet + sidecar JSON for cursor/config resume
+
+**DoD:** 37 passing tests (total 80). Label/abstain/edit/clear transitions work. Autosave → reopen restores cursor and labels. GeoTIFF opens in QGIS with correct geotransform. Multi-panel layouts tested.
 
 ### 📋 M3 — GUI shell & rendering
 
