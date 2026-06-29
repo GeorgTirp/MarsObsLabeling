@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QLabel,
     QFileDialog,
+    QDialog,
     QMenu,
     QMenuBar,
     QProgressDialog,
@@ -30,6 +31,7 @@ from marslabeler.ui.sidepreview import SidePreview
 from marslabeler.ui.legendpanel import LegendPanel
 from marslabeler.ui.historypanel import HistoryPanel
 from marslabeler.ui.controller import KeyboardController
+from marslabeler.ui.preprocessdialog import PreprocessDialog
 
 
 class PanelLoadWorker(QThread):
@@ -71,6 +73,7 @@ class MainWindow(QMainWindow):
         self.panel_load_worker: Optional[PanelLoadWorker] = None
         self.controller: Optional[KeyboardController] = None
         self.autosave_timer = None
+        self.skip_decisions = {}
 
         # UI Components
         self._setup_ui()
@@ -186,6 +189,18 @@ class MainWindow(QMainWindow):
 
             # Setup autosave timer
             self._setup_autosave()
+
+            # Show preprocessing dialog
+            preprocess_dialog = PreprocessDialog(raster, grid, self.config.to_dict())
+            preprocess_dialog.start_preprocessing()
+
+            if preprocess_dialog.exec() != QDialog.DialogCode.Accepted:
+                self.status_label.setText("Loading cancelled")
+                raster.close()
+                return
+
+            # Store skip decisions for later use
+            self.skip_decisions = preprocess_dialog.get_skip_decisions()
 
             # Update UI
             self._update_history_panel()
