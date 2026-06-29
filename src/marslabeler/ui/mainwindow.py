@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QProgressDialog,
 )
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeyEvent
 
 from marslabeler.io.raster import RasterSource
 from marslabeler.model.grid import Grid
