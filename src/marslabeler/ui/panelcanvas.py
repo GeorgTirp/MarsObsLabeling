@@ -23,7 +23,6 @@ class PanelCanvas(QGraphicsView):
         super().__init__(parent)
         self.scene = QGraphicsScene()
         self.setScene(self.scene)
-        self.setRenderHint(QGraphicsView.RenderHint.SmoothPixmapTransform)
         self.setBackgroundBrush(Qt.GlobalColor.black)
 
         # Layer management
