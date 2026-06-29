@@ -1,0 +1,29 @@
+paths:
+  classes_file: configs/classes.yaml
+  labels_dir: ./labels
+
+geometry:
+  panel_size: 4096
+  block_size: 512
+
+navigation:
+  advance_mode: next_unlabeled  # next_unlabeled | next_sequential
+  advance_on_edit: false
+
+display:
+  max_canvas_px: 1600
+  stretch_percentiles: [1, 99]
+
+skip:
+  nodata_skip_threshold: 0.5
+  variance_skip_threshold: 0.0
+  skip_low_variance: false
+
+autosave:
+  every_n_labels: 25
+  every_seconds: 30
+
+export:
+  full_res: false
+
+labeler: null  # null -> OS username
