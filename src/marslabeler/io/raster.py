@@ -7,6 +7,8 @@ import numpy as np
 import rasterio
 from rasterio.transform import Affine
 
+from marslabeler.io.preprocess import compute_invalid_mask
+
 
 class RasterSource:
     """Wraps a raster (JP2, GeoTIFF) via rasterio for efficient windowed reads."""
@@ -119,6 +121,11 @@ class RasterSource:
         """
         Estimate nodata fraction in a window using a decimated read.
 
+        Uses dtype-aware detection aligned with AI4ExoMars preprocessing:
+        - uint8: marks 0 and 255 as invalid
+        - uint16: marks 0 as invalid
+        - float: marks non-finite and <= -3.0e38 as invalid
+
         Args:
             x, y, width, height: window in full-image pixel coords
 
@@ -133,11 +140,9 @@ class RasterSource:
         if decimated.size == 0:
             return 1.0
 
-        nodata_val = self.nodata
-        if nodata_val is None:
-            return 0.0
-
-        nodata_count = np.sum(decimated == nodata_val)
+        # Use AI4ExoMars dtype-aware invalid mask
+        invalid_mask = compute_invalid_mask(decimated)
+        nodata_count = np.sum(invalid_mask)
         return float(nodata_count) / decimated.size
 
     def variance(self, x: int, y: int, width: int, height: int) -> float:

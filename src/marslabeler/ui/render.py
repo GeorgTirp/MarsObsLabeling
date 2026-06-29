@@ -6,6 +6,8 @@ import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QImage, QPixmap, QColor, QPainter, QPen, QBrush
 
+from marslabeler.io.preprocess import apply_display_stretch_with_mask, compute_invalid_mask
+
 
 def numpy_to_qimage(data: np.ndarray) -> QImage:
     """
@@ -33,33 +35,23 @@ def apply_display_stretch(
     Apply robust percentile stretch to enhance contrast (viewing only).
 
     This is for display purposes only and never affects labels.
+    Automatically detects and ignores invalid (nodata/black) pixels.
 
     Args:
         data: Input array (any dtype)
         percentiles: (low, high) percentiles for stretch
 
     Returns:
-        uint8 array stretched to [0, 255]
+        uint8 array stretched to [0, 255], with invalid pixels set to 0
     """
     if data.size == 0:
         return np.zeros((data.shape), dtype=np.uint8)
 
-    # Ignore nodata/nan for percentile calculation
-    valid = data[~np.isnan(data)]
-    if valid.size == 0:
-        return np.zeros(data.shape, dtype=np.uint8)
+    # Detect invalid pixels (dtype-aware: 0 and 255 for uint8, etc.)
+    invalid_mask = compute_invalid_mask(data)
 
-    p_low, p_high = np.percentile(valid, percentiles)
-
-    if p_low == p_high:
-        # Uniform data
-        stretched = np.ones_like(data, dtype=np.uint8) * 128
-    else:
-        # Clip and stretch
-        clipped = np.clip(data, p_low, p_high)
-        stretched = ((clipped - p_low) / (p_high - p_low) * 255).astype(np.uint8)
-
-    return stretched
+    # Use preprocessing function that handles invalid pixels
+    return apply_display_stretch_with_mask(data, percentiles, invalid_mask)
 
 
 def create_grid_overlay(
