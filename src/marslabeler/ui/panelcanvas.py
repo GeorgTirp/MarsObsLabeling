@@ -4,7 +4,7 @@ from typing import Optional, Callable
 
 import numpy as np
 from PySide6.QtCore import Qt, QSize, QRectF
-from PySide6.QtGui import QPixmap, QImage, QColor, QPen
+from PySide6.QtGui import QPixmap, QImage, QColor, QPen, QBrush
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem
 
 from marslabeler.ui.render import (
@@ -30,6 +30,7 @@ class PanelCanvas(QGraphicsView):
         self.grid_item: Optional[QGraphicsPixmapItem] = None
         self.label_overlay_item: Optional[QGraphicsPixmapItem] = None
         self.highlight_item: Optional[QGraphicsPixmapItem] = None
+        self.selection_item: Optional[QGraphicsRectItem] = None
 
         # Current state
         self.canvas_width = 1600
@@ -39,8 +40,20 @@ class PanelCanvas(QGraphicsView):
         self.blocks_per_row = 8
         self.blocks_per_col = 8
 
-        # Click callback
+        # Interaction callbacks
         self.on_block_clicked: Optional[Callable[[int, int], None]] = None
+        # Drag-paint: called for each block while the left button is held
+        # (is_start=True on the initial press of the stroke)
+        self.on_block_paint: Optional[Callable[[int, int, bool], None]] = None
+        # Drag-paint finished (mouse released)
+        self.on_block_paint_end: Optional[Callable[[], None]] = None
+        # Marquee selection finished: (r0, c0, r1, c1) inclusive block range
+        self.on_selection_made: Optional[Callable[[int, int, int, int], None]] = None
+        self._last_paint_cell: Optional[tuple[int, int]] = None
+
+        # Shift+drag marquee selection state
+        self._selecting = False
+        self._sel_anchor: Optional[tuple[int, int]] = None
 
     def set_panel_image(self, panel_data: np.ndarray, stretch_percentiles=(1, 99)) -> None:
         """
@@ -145,20 +158,91 @@ class PanelCanvas(QGraphicsView):
         """Update view to fit scene."""
         self.fitInView(self.scene.itemsBoundingRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
-    def mousePressEvent(self, event) -> None:
-        """Handle mouse clicks on blocks."""
-        if not self.on_block_clicked:
-            return
-
-        scene_pos = self.mapToScene(event.pos())
+    def _block_at(self, pos) -> tuple[int, int]:
+        """Map a widget position to a (block_row, block_col), clamped to the grid."""
+        scene_pos = self.mapToScene(pos)
         block_col = int(scene_pos.x() / self.block_width)
         block_row = int(scene_pos.y() / self.block_height)
-
-        # Clamp to grid
         block_col = max(0, min(block_col, self.blocks_per_row - 1))
         block_row = max(0, min(block_row, self.blocks_per_col - 1))
+        return block_row, block_col
 
-        self.on_block_clicked(block_row, block_col)
+    def set_selection_rect(self, r0: int, c0: int, r1: int, c1: int) -> None:
+        """Draw/update the yellow marquee covering blocks [r0..r1] x [c0..c1]."""
+        x = c0 * self.block_width
+        y = r0 * self.block_height
+        w = (c1 - c0 + 1) * self.block_width
+        h = (r1 - r0 + 1) * self.block_height
+
+        if self.selection_item is None:
+            pen = QPen(QColor(255, 255, 0), 2, Qt.PenStyle.SolidLine)
+            brush = QBrush(QColor(255, 255, 0, 60))  # translucent yellow fill
+            self.selection_item = self.scene.addRect(x, y, w, h, pen, brush)
+            self.selection_item.setZValue(10)  # above overlays
+        else:
+            self.selection_item.setRect(x, y, w, h)
+
+    def clear_selection(self) -> None:
+        """Remove the marquee selection rectangle."""
+        if self.selection_item is not None:
+            self.scene.removeItem(self.selection_item)
+            self.selection_item = None
+
+    def mousePressEvent(self, event) -> None:
+        """Shift+drag = marquee selection; plain = navigate + start paint stroke."""
+        block_row, block_col = self._block_at(event.pos())
+        self._last_paint_cell = (block_row, block_col)
+
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        if shift:
+            # Begin a rubber-band selection
+            self._selecting = True
+            self._sel_anchor = (block_row, block_col)
+            self.set_selection_rect(block_row, block_col, block_row, block_col)
+            return
+
+        self._selecting = False
+        if self.on_block_clicked:
+            self.on_block_clicked(block_row, block_col)
+        # Begin a potential drag-paint stroke (handler no-ops if no class is held)
+        if self.on_block_paint:
+            self.on_block_paint(block_row, block_col, True)
+
+    def mouseMoveEvent(self, event) -> None:
+        """Extend the marquee, or drag-paint blocks while LMB is held."""
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            return
+
+        block_row, block_col = self._block_at(event.pos())
+
+        if self._selecting and self._sel_anchor is not None:
+            r0, r1 = sorted((self._sel_anchor[0], block_row))
+            c0, c1 = sorted((self._sel_anchor[1], block_col))
+            self.set_selection_rect(r0, c0, r1, c1)
+            return
+
+        cell = (block_row, block_col)
+        if cell != self._last_paint_cell:
+            self._last_paint_cell = cell
+            if self.on_block_paint:
+                self.on_block_paint(block_row, block_col, False)
+
+    def mouseReleaseEvent(self, event) -> None:
+        """Finalize the marquee selection, or end a drag-paint stroke."""
+        if self._selecting and self._sel_anchor is not None:
+            block_row, block_col = self._block_at(event.pos())
+            r0, r1 = sorted((self._sel_anchor[0], block_row))
+            c0, c1 = sorted((self._sel_anchor[1], block_col))
+            self.set_selection_rect(r0, c0, r1, c1)  # keep it highlighted
+            self._selecting = False
+            self._sel_anchor = None
+            if self.on_selection_made:
+                self.on_selection_made(r0, c0, r1, c1)
+            return
+
+        self._last_paint_cell = None
+        if self.on_block_paint_end:
+            self.on_block_paint_end()
 
     def resizeEvent(self, event) -> None:
         """Handle resize to maintain fit."""

@@ -143,13 +143,22 @@ class LabelStore:
             record.gsd = abs(grid.transform.a)
             self.records[block.block_id] = record
 
-    def assign(self, block_id: str, class_id: int, class_name: str) -> None:
-        """Assign a class to a block."""
+    def assign(
+        self, block_id: str, class_id: int, class_name: str, snapshot: bool = True
+    ) -> None:
+        """
+        Assign a class to a block.
+
+        snapshot=False skips the undo snapshot and redo-clear — used for the
+        continuation cells of a drag-paint stroke so the whole stroke is one
+        undo step (the first cell is assigned with snapshot=True).
+        """
         if block_id not in self.records:
             raise ValueError(f"Unknown block: {block_id}")
 
         # Save current state to undo stack
-        self._save_undo_state()
+        if snapshot:
+            self._save_undo_state()
 
         record = self.records[block_id]
         record.class_id = class_id
@@ -159,7 +168,8 @@ class LabelStore:
         record.edit_count += 1
 
         # Clear redo stack on new action
-        self.redo_stack.clear()
+        if snapshot:
+            self.redo_stack.clear()
 
     def bulk_assign(self, block_ids: list[str], class_id: int, class_name: str) -> int:
         """
@@ -184,6 +194,28 @@ class LabelStore:
             record.edit_count += 1
         self.redo_stack.clear()
         return len(targets)
+
+    def set_nodata_bulk(self, block_ids: list[str]) -> int:
+        """
+        Mark many blocks as nodata without undo snapshots.
+
+        Used at load time to retire fully off-swath (empty) panels — this is a
+        preprocessing baseline, not a user edit, so it is not undoable.
+        Returns the number of blocks changed.
+        """
+        now = int(time.time() * 1000)
+        changed = 0
+        for block_id in block_ids:
+            if block_id not in self.records:
+                continue
+            record = self.records[block_id]
+            record.class_id = -2
+            record.class_name = "No data"
+            record.status = "nodata"
+            record.updated_utc = now
+            record.edit_count += 1
+            changed += 1
+        return changed
 
     def set_nodata(self, block_id: str) -> None:
         """Mark a block as nodata."""

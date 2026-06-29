@@ -61,6 +61,12 @@ class MainWindow(QMainWindow):
         self.na_class_id: Optional[int] = None
         self.na_class_name: Optional[str] = None
         self.saved_complete_panels: set[int] = set()
+        self.empty_panels: set[int] = set()  # fully off-swath panels: hidden + skipped
+        # Region labeling: held class key (drag-paint brush) + last used class
+        self.held_class_id: Optional[int] = None
+        self.last_class_id: Optional[int] = None
+        # Active marquee selection (r0, c0, r1, c1) awaiting a class key to fill
+        self.selection_rect: Optional[tuple[int, int, int, int]] = None
 
         # UI Components
         self._setup_ui()
@@ -84,6 +90,9 @@ class MainWindow(QMainWindow):
         # Center: Panel canvas
         self.canvas = PanelCanvas()
         self.canvas.on_block_clicked = self._on_block_clicked
+        self.canvas.on_block_paint = self._on_block_paint
+        self.canvas.on_block_paint_end = self._on_block_paint_end
+        self.canvas.on_selection_made = self._on_selection_made
         main_layout.addWidget(self.canvas, 1)
 
         # Right: Preview (top) and legend (below) vertical stack
@@ -212,6 +221,15 @@ class MainWindow(QMainWindow):
             # Store skip decisions for later use
             self.skip_decisions = preprocess_dialog.get_skip_decisions()
 
+            # Detect fully off-swath panels: retire them (mark nodata), hide + skip
+            self.empty_panels = self._compute_empty_panels()
+            self._retire_empty_panels()
+            # Start on the first panel that actually has image content
+            if self.session.current_block().panel_idx in self.empty_panels:
+                first = self._first_nonempty_panel()
+                if first is not None:
+                    self.session.move_to_panel(first)
+
             # Update UI
             self._update_history_panel()
             self._update_legend_panel()
@@ -241,7 +259,9 @@ class MainWindow(QMainWindow):
 
     def _update_history_panel(self):
         """Swap the history placeholder for the real panel (by reference)."""
-        history = HistoryPanel(self.session.grid, self.session.labels)
+        history = HistoryPanel(
+            self.session.grid, self.session.labels, hidden_panels=self.empty_panels
+        )
         history.on_panel_selected = self._on_panel_selected
         history.setMaximumWidth(200)
         old_item = self.main_layout.replaceWidget(self.history_panel, history)
@@ -262,8 +282,9 @@ class MainWindow(QMainWindow):
         if not self.session:
             return
 
-        # Keep the displayed panel in sync with the cursor
+        # Keep the displayed panel in sync with the cursor; drop stale selection
         self.current_panel_idx = self.session.current_block().panel_idx
+        self._clear_selection()
         self.status_label.setText(f"Loading panel {self.current_panel_idx}...")
 
         # Synchronous decimated read — fast via GDAL overviews, no thread to crash
@@ -284,27 +305,8 @@ class MainWindow(QMainWindow):
         grid = self.session.grid
         self.canvas.set_grid(grid.blocks_per_panel_row, grid.blocks_per_panel_col)
 
-        # Build label overlay (class_id → color)
-        panel_blocks = grid.get_panel_blocks(self.current_panel_idx)
-        block_data = np.full(
-            (grid.blocks_per_panel_row, grid.blocks_per_panel_col),
-            -3,  # unlabeled
-            dtype=np.int16,
-        )
-
-        for block in panel_blocks:
-            record = self.session.labels.get_record(block.block_id)
-            output_row = block.block_row
-            output_col = block.block_col
-            block_data[output_row, output_col] = record.class_id
-
-        class_colors = {
-            cls_id: cls_obj.color for cls_id, cls_obj in self.classes_scheme.classes.items()
-        }
-        class_colors[self.classes_scheme.abstain.id] = self.classes_scheme.abstain.color
-        class_colors[self.classes_scheme.nodata.id] = self.classes_scheme.nodata.color
-
-        self.canvas.set_label_overlay(block_data, class_colors)
+        # Build the colored label overlay
+        self._refresh_label_overlay()
 
         # Set current block highlight
         current_block = self.session.current_block()
@@ -335,18 +337,21 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(100, self._show_help)
 
     def _on_block_clicked(self, block_row: int, block_col: int):
-        """Handle panel canvas block click."""
+        """Plain click: move the cursor to the block and set it as the rectangle anchor."""
         if not self.session:
             return
 
-        # Navigate to clicked block
+        # A plain click cancels any pending marquee selection
+        self._clear_selection()
+
         grid = self.session.grid
         panel_blocks = grid.get_panel_blocks(self.current_panel_idx)
         local_idx = block_row * grid.blocks_per_panel_col + block_col
         if local_idx < len(panel_blocks):
             block_idx = self.current_panel_idx * grid.blocks_per_panel + local_idx
             self.session.move_to_block(block_idx)
-            self._load_current_panel()
+            # Same panel image — just move highlight + preview (no raster reload)
+            self._on_cursor_changed()
 
     def _on_panel_selected(self, panel_idx: int):
         """Handle history panel click: move the cursor into that panel and show it.
@@ -360,15 +365,149 @@ class MainWindow(QMainWindow):
         self._load_current_panel()             # re-syncs current_panel_idx from cursor
         self._refresh_history()
 
+    # ------------------------------------------------------------------ #
+    # Region labeling: drag-paint brush + Shift+click rectangle
+    # ------------------------------------------------------------------ #
+
+    def _class_colors(self) -> dict[int, str]:
+        """class_id → hex color, including abstain/nodata."""
+        colors = {
+            cid: c.color for cid, c in self.classes_scheme.classes.items()
+        }
+        colors[self.classes_scheme.abstain.id] = self.classes_scheme.abstain.color
+        colors[self.classes_scheme.nodata.id] = self.classes_scheme.nodata.color
+        return colors
+
+    def _refresh_label_overlay(self) -> None:
+        """Rebuild only the colored block overlay (no raster re-read)."""
+        if not self.session:
+            return
+        grid = self.session.grid
+        block_data = np.full(
+            (grid.blocks_per_panel_row, grid.blocks_per_panel_col), -3, dtype=np.int16
+        )
+        for block in grid.get_panel_blocks(self.current_panel_idx):
+            record = self.session.labels.get_record(block.block_id)
+            block_data[block.block_row, block.block_col] = record.class_id
+        self.canvas.set_label_overlay(block_data, self._class_colors())
+
+    def _panel_block_map(self) -> dict:
+        """(block_row, block_col) → BlockInfo for the current panel."""
+        return {
+            (b.block_row, b.block_col): b
+            for b in self.session.grid.get_panel_blocks(self.current_panel_idx)
+        }
+
+    def _hotkey_class_id(self, event: QKeyEvent) -> Optional[int]:
+        """Resolve a key event to any class id (user classes or abstain), or None."""
+        if not self.classes_scheme:
+            return None
+        text = event.text()
+        if event.key() == Qt.Key.Key_Space or text == " ":
+            text = "space"
+        return self.classes_scheme.hotkey_to_id.get(text)
+
+    def _class_id_for_event(self, event: QKeyEvent) -> Optional[int]:
+        """Resolve a key event to a user class id (>=0), or None (for the paint brush)."""
+        cid = self._hotkey_class_id(event)
+        return cid if (cid is not None and cid >= 0) else None
+
+    def _on_block_paint(self, block_row: int, block_col: int, is_start: bool) -> None:
+        """Drag-paint: label the block under the cursor with the held class brush."""
+        if self.held_class_id is None or not self.session:
+            return
+        block = self._panel_block_map().get((block_row, block_col))
+        if block is None:
+            return
+        # snapshot only on the first cell so the whole stroke is one undo step
+        self.session.labels.assign(
+            block.block_id,
+            self.held_class_id,
+            self.classes_scheme.get_name(self.held_class_id),
+            snapshot=is_start,
+        )
+        self._refresh_label_overlay()
+
+    def _on_block_paint_end(self) -> None:
+        """End of a drag-paint stroke: refresh history and autosave if completed."""
+        if self.held_class_id is None or not self.session:
+            return
+        self._refresh_history()
+        self._maybe_save_completed_panel(self.current_panel_idx)
+
+    def _on_selection_made(self, r0: int, c0: int, r1: int, c1: int) -> None:
+        """A Shift+drag marquee was completed — remember it and await a class key."""
+        self.selection_rect = (r0, c0, r1, c1)
+        n = (r1 - r0 + 1) * (c1 - c0 + 1)
+        self.status_label.setText(
+            f"Selected {n} blocks — press a class key (q/w/e) to fill, or Esc to cancel"
+        )
+
+    def _clear_selection(self) -> None:
+        """Drop the marquee selection and remove its highlight."""
+        if self.selection_rect is not None:
+            self.selection_rect = None
+            self.canvas.clear_selection()
+
+    def _fill_selection(self, class_id: int) -> None:
+        """Fill every block in the marquee selection with the given class."""
+        if self.selection_rect is None or not self.session:
+            return
+        r0, c0, r1, c1 = self.selection_rect
+        bmap = self._panel_block_map()
+        ids = [
+            bmap[(r, c)].block_id
+            for r in range(r0, r1 + 1)
+            for c in range(c0, c1 + 1)
+            if (r, c) in bmap
+        ]
+        name = self.classes_scheme.get_name(class_id)
+        if ids:
+            self.session.labels.bulk_assign(ids, class_id, name)
+        if class_id >= 0:
+            self.last_class_id = class_id
+        self._clear_selection()
+        self._refresh_label_overlay()
+        self._refresh_history()
+        self._maybe_save_completed_panel(self.current_panel_idx)
+        self.status_label.setText(f"Filled {len(ids)} blocks with {name}")
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """Handle keyboard input."""
         # Ignore input while the loading overlay is up (except letting Esc through)
         if self.loading_overlay is not None:
             super().keyPressEvent(event)
             return
+
+        # If a marquee selection is active, a class key fills it (Esc cancels it)
+        if self.selection_rect is not None and not event.isAutoRepeat():
+            if event.key() == Qt.Key.Key_Escape:
+                self._clear_selection()
+                self.status_label.setText("Selection cancelled")
+                return
+            cid = self._hotkey_class_id(event)
+            if cid is not None:
+                self._fill_selection(cid)
+                return
+
+        # Track the held class key so it can act as a drag-paint brush
+        if not event.isAutoRepeat():
+            cid = self._class_id_for_event(event)
+            if cid is not None:
+                self.held_class_id = cid
+                self.last_class_id = cid
+
         if self.controller and self.controller.handle_key_press(event):
             return
         super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event: QKeyEvent) -> None:
+        """Release the drag-paint brush when its class key is let go."""
+        if not event.isAutoRepeat():
+            cid = self._class_id_for_event(event)
+            if cid is not None and cid == self.held_class_id:
+                self.held_class_id = None
+        super().keyReleaseEvent(event)
 
     def resizeEvent(self, event) -> None:
         """Keep the loading overlay covering the whole window on resize."""
@@ -517,18 +656,67 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Save error: {str(e)}")
 
     def _go_to_next_panel(self) -> None:
-        """Button/handler: finalize current panel (NA-fill + save), then advance."""
+        """Button/handler: finalize current panel (NA-fill + save), then advance.
+
+        Skips over fully off-swath (empty) panels.
+        """
         if not self.session:
             return
 
         leaving = self.current_panel_idx
         self._finalize_panel(leaving)
 
-        # Advance to the next panel (stays put if already on the last one)
-        self.session.move_to_panel(leaving + 1)
-        self.current_panel_idx = self.session.current_block().panel_idx
+        nxt = self._next_nonempty_panel(leaving)
+        if nxt is None:
+            self.status_label.setText("No more panels with image content")
+            return
+
+        self.session.move_to_panel(nxt)
+        self.current_panel_idx = nxt
         self._load_current_panel()
         self._refresh_history()
+
+    # ---- empty (off-swath) panel handling -----------------------------
+
+    def _compute_empty_panels(self) -> set[int]:
+        """Panels where every block is essentially all no-data (off-swath)."""
+        empty: set[int] = set()
+        if not self.skip_decisions:
+            return empty
+        for panel_idx in range(self.session.grid.num_panels):
+            blocks = self.session.grid.get_panel_blocks(panel_idx)
+            if blocks and all(
+                self.skip_decisions.get(b.block_id, {}).get("nodata_fraction", 0.0) >= 0.95
+                for b in blocks
+            ):
+                empty.add(panel_idx)
+        return empty
+
+    def _retire_empty_panels(self) -> None:
+        """Mark every block in empty panels as nodata so they're done + skippable."""
+        if not self.empty_panels:
+            return
+        ids = [
+            b.block_id
+            for panel_idx in self.empty_panels
+            for b in self.session.grid.get_panel_blocks(panel_idx)
+        ]
+        if ids:
+            self.session.labels.set_nodata_bulk(ids)
+            self.saved_complete_panels.update(self.empty_panels)
+
+    def _first_nonempty_panel(self) -> Optional[int]:
+        for p in range(self.session.grid.num_panels):
+            if p not in self.empty_panels:
+                return p
+        return None
+
+    def _next_nonempty_panel(self, after: int) -> Optional[int]:
+        p = after + 1
+        n = self.session.grid.num_panels
+        while p < n and p in self.empty_panels:
+            p += 1
+        return p if p < n else None
 
     def _refresh_history(self) -> None:
         """Refresh the history panel's progress bars and done markers in place."""

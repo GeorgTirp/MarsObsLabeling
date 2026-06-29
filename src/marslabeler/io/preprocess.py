@@ -72,11 +72,13 @@ def apply_display_stretch_with_mask(
         valid = arr.ravel()
 
     if valid.size == 0:
-        return np.ones_like(data, dtype=np.uint8) * 128
+        # Whole region is invalid/no-data (off-swath, NULL, or saturated) → black
+        return np.zeros_like(data, dtype=np.uint8)
 
     p_low, p_high = np.percentile(valid, percentiles)
 
     if p_low == p_high:
+        # Uniform but valid region → mid grey is a reasonable neutral
         stretched = np.ones_like(arr, dtype=np.uint8) * 128
     else:
         # Clip and stretch

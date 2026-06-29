@@ -22,10 +22,11 @@ _DONE_STATUSES = ("labeled", "abstain", "nodata")
 class HistoryPanel(QWidget):
     """Shows all panels with completion progress and a done/saved marker."""
 
-    def __init__(self, grid: Grid, label_store: LabelStore, parent=None):
+    def __init__(self, grid: Grid, label_store: LabelStore, parent=None, hidden_panels=None):
         super().__init__(parent)
         self.grid = grid
         self.label_store = label_store
+        self.hidden_panels = set(hidden_panels or ())  # fully empty panels to omit
         self.on_panel_selected: Optional[Callable[[int], None]] = None
 
         # Stored references so we can refresh in place (no rebuild on every label)
@@ -54,8 +55,10 @@ class HistoryPanel(QWidget):
         list_layout.setContentsMargins(4, 4, 4, 4)
         list_widget.setLayout(list_layout)
 
-        # Add panel items
+        # Add panel items (skip fully-empty/no-data panels)
         for panel_idx in range(grid.num_panels):
+            if panel_idx in self.hidden_panels:
+                continue
             item = self._create_panel_item(panel_idx)
             list_layout.addWidget(item)
 
