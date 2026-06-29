@@ -93,13 +93,27 @@ mars-labeler/
 
 **DoD:** 37 passing tests (total 80). Label/abstain/edit/clear transitions work. Autosave → reopen restores cursor and labels. GeoTIFF opens in QGIS with correct geotransform. Multi-panel layouts tested.
 
-### 📋 M3 — GUI shell & rendering
+### ✅ M3 — GUI shell & rendering (COMPLETE)
 
-Read-only visualization: panel canvas, side preview, legend, history panel, status bar.
+**Components:**
+- `ui/render.py`: numpy→QImage, display stretch, grid/overlay/highlight compositing
+- `ui/panelcanvas.py`: QGraphicsView with multi-layer composition
+- `ui/sidepreview.py`: Native-res block preview
+- `ui/legendpanel.py`: Class legend with colors/names/hotkeys
+- `ui/historypanel.py`: Panel list with completion progress
+- `ui/mainwindow.py`: Main window, layout, File→Open, status bar, worker threads
 
-### 📋 M4 — Interaction: keyboard labeling loop
+**DoD:** Read-only visualization complete. Open JP2 → see panel with grid, side preview, legend, history. Pre-seeded labels tinted. Worker thread keeps UI responsive. 24 tests (render + components).
 
-Full keybinding implementation (class keys, navigation, editing, undo/redo, auto-advance).
+### ✅ M4 — Interaction: keyboard labeling loop (COMPLETE)
+
+**Components:**
+- `ui/controller.py`: Keyboard input → Session mutations + UI callbacks
+- Keyboard bindings: class hotkeys, arrows, PageUp/Down, Home, Backspace, Undo/Redo
+- Auto-advance on label/abstain, no-advance on edit
+- Autosave trigger integration (by label count or elapsed time)
+
+**DoD:** Full labeling workflow with keyboard only. Label → auto-advance. Arrow keys navigate. Edit existing blocks. Undo/redo restores state. Panel jumps. Autosave on thresholds and resume correctly. 16 controller tests.
 
 ### 📋 M5 — Polish, QA, packaging, acceptance
 

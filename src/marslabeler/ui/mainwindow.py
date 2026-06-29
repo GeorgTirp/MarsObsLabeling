@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtWidgets import (
     QMainWindow,
     QWidget,
@@ -29,6 +29,7 @@ from marslabeler.ui.panelcanvas import PanelCanvas
 from marslabeler.ui.sidepreview import SidePreview
 from marslabeler.ui.legendpanel import LegendPanel
 from marslabeler.ui.historypanel import HistoryPanel
+from marslabeler.ui.controller import KeyboardController
 
 
 class PanelLoadWorker(QThread):
@@ -68,6 +69,8 @@ class MainWindow(QMainWindow):
         self.classes_scheme = None
         self.current_panel_idx = 0
         self.panel_load_worker: Optional[PanelLoadWorker] = None
+        self.controller: Optional[KeyboardController] = None
+        self.autosave_timer = None
 
         # UI Components
         self._setup_ui()
@@ -174,6 +177,15 @@ class MainWindow(QMainWindow):
                 labels_dir,
                 labeler=self.config.labeler or "unknown",
             )
+
+            # Create keyboard controller
+            self.controller = KeyboardController(self.session, self.classes_scheme)
+            self.controller.on_label_changed = self._on_labels_changed
+            self.controller.on_panel_changed = self._on_panel_changed_kb
+            self.controller.on_cursor_changed = self._on_cursor_changed
+
+            # Setup autosave timer
+            self._setup_autosave()
 
             # Update UI
             self._update_history_panel()
@@ -296,3 +308,70 @@ class MainWindow(QMainWindow):
         """Handle history panel selection."""
         self.current_panel_idx = panel_idx
         self._load_current_panel()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        """Handle keyboard input."""
+        if self.controller and self.controller.handle_key_press(event):
+            return
+        super().keyPressEvent(event)
+
+    def _on_labels_changed(self) -> None:
+        """Callback: labels have changed, refresh UI."""
+        self._load_current_panel()  # Reload to show updated overlays
+
+    def _on_panel_changed_kb(self) -> None:
+        """Callback: panel changed via keyboard, load new panel."""
+        # Update panel index based on current block
+        self.current_panel_idx = self.session.current_block().panel_idx
+        self._load_current_panel()
+
+    def _on_cursor_changed(self) -> None:
+        """Callback: cursor moved, update preview only."""
+        if not self.session:
+            return
+
+        current_block = self.session.current_block()
+        self.canvas.set_current_block_highlight(current_block.block_row, current_block.block_col)
+
+        # Update preview
+        block_data_native = self.session.raster.read_window(
+            current_block.x_px,
+            current_block.y_px,
+            current_block.w_px,
+            current_block.h_px,
+            current_block.w_px,
+            current_block.h_px,
+        )
+        self.preview.set_block_image(block_data_native, current_block.block_id)
+
+    def _setup_autosave(self) -> None:
+        """Setup autosave timer."""
+        if self.autosave_timer:
+            self.autosave_timer.stop()
+
+        self.autosave_timer = QTimer()
+        autosave_interval = self.config.autosave.every_seconds * 1000  # ms
+        self.autosave_timer.setInterval(autosave_interval)
+        self.autosave_timer.timeout.connect(self._maybe_autosave)
+        self.autosave_timer.start()
+
+    def _maybe_autosave(self) -> None:
+        """Check if autosave should trigger."""
+        if not self.session or not self.controller:
+            return
+
+        if self.controller.should_autosave():
+            self._do_autosave()
+
+    def _do_autosave(self) -> None:
+        """Perform autosave."""
+        if not self.session:
+            return
+
+        try:
+            labels_dir = Path(self.config.paths.labels_dir)
+            self.session.save_session(labels_dir)
+            self.controller.reset_autosave()
+            self.status_label.setText(f"Auto-saved (panel {self.current_panel_idx})")
+        except Exception as e:
+            self.status_label.setText(f"Autosave error: {str(e)}")
