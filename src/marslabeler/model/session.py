@@ -89,35 +89,44 @@ class Session:
             self._advance_to_next_sequential()
 
     def _advance_to_next_unlabeled(self) -> None:
-        """Advance to the next unlabeled block (skipping nodata/skip candidates)."""
-        start_idx = self.current_block_idx + 1
+        """Advance to the next unlabeled block (skipping nodata/skip candidates).
+
+        Stays within the current panel until *every* block in it is done — first
+        searching forward from the current block, then wrapping back to any
+        unlabeled block earlier in the panel. Only when the whole panel is
+        complete does it move on to the next incomplete panel.
+        """
         current_panel = self.current_block().panel_idx
+        panel_start = current_panel * self.grid.blocks_per_panel
+        panel_end = min(
+            (current_panel + 1) * self.grid.blocks_per_panel, self.grid.num_blocks()
+        )
 
-        # Search in current panel
-        for idx in range(start_idx, (current_panel + 1) * self.grid.blocks_per_panel):
-            if idx >= self.grid.num_blocks():
-                break
-            block = self.grid.get_block(idx)
-            record = self.labels.get_record(block.block_id)
-            if record.status == "unlabeled" and not self._should_skip_block(block):
-                self.current_block_idx = idx
-                return
+        def _first_unlabeled(idx_range) -> bool:
+            for idx in idx_range:
+                block = self.grid.get_block(idx)
+                record = self.labels.get_record(block.block_id)
+                if record.status == "unlabeled" and not self._should_skip_block(block):
+                    self.current_block_idx = idx
+                    return True
+            return False
 
-        # Move to next incomplete panel and search
+        # 1) Forward within the current panel (after the current block)
+        if _first_unlabeled(range(self.current_block_idx + 1, panel_end)):
+            return
+        # 2) Wrap back to any unlabeled block earlier in the same panel
+        if _first_unlabeled(range(panel_start, self.current_block_idx)):
+            return
+
+        # 3) Current panel fully done → next incomplete panel (then wrap around)
         for panel_idx in range(current_panel + 1, self.grid.num_panels):
-            if self._is_panel_complete(panel_idx):
-                continue
-            first_block_idx = panel_idx * self.grid.blocks_per_panel
-            self.current_block_idx = first_block_idx
-            return
-
-        # If we get here, wrap to first unlabeled in first incomplete panel
+            if not self._is_panel_complete(panel_idx):
+                self.current_block_idx = panel_idx * self.grid.blocks_per_panel
+                return
         for panel_idx in range(self.grid.num_panels):
-            if self._is_panel_complete(panel_idx):
-                continue
-            first_block_idx = panel_idx * self.grid.blocks_per_panel
-            self.current_block_idx = first_block_idx
-            return
+            if not self._is_panel_complete(panel_idx):
+                self.current_block_idx = panel_idx * self.grid.blocks_per_panel
+                return
 
     def _advance_to_next_sequential(self) -> None:
         """Advance to the next block in order."""
