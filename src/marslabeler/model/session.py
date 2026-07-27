@@ -218,17 +218,39 @@ class Session:
         parquet_path = labels_dir / f"{self.grid.obs_id}.parquet"
         self.labels.save_parquet(parquet_path)
 
-        # Save session JSON
+        # Save session JSON. img_width/img_height let a later run detect that the
+        # saved labels belong to a different image (wrong-picture guard); panel_size/
+        # block_size let it detect a different tile resolution.
         session_data = {
             "obs_id": self.grid.obs_id,
             "current_block_idx": self.current_block_idx,
             "panel_size": self.grid.panel_size,
             "block_size": self.grid.block_size,
+            "img_width": self.grid.img_width,
+            "img_height": self.grid.img_height,
             "timestamp": int(time.time() * 1000),
         }
         session_path = labels_dir / f"{self.grid.obs_id}.session.json"
         with open(session_path, "w") as f:
             json.dump(session_data, f, indent=2)
+
+    @staticmethod
+    def read_saved_metadata(labels_dir: Path, obs_id: str) -> Optional[dict]:
+        """Return the stored session.json for obs_id if a resumable session exists.
+
+        A session is resumable only when BOTH the labels (.parquet) and the cursor
+        (.session.json) files are present. Returns None otherwise.
+        """
+        labels_dir = Path(labels_dir)
+        parquet_path = labels_dir / f"{obs_id}.parquet"
+        session_path = labels_dir / f"{obs_id}.session.json"
+        if not (parquet_path.exists() and session_path.exists()):
+            return None
+        try:
+            with open(session_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return None
 
     @classmethod
     def load_or_create(
@@ -252,10 +274,13 @@ class Session:
             label_store = LabelStore.load_parquet(parquet_path, grid, labeler)
             session = cls(raster, grid, label_store, config)
 
-            # Restore cursor position
+            # Restore cursor position (clamp: a stale/mismatched index must not
+            # leave current_block_idx pointing outside the grid)
             with open(session_path) as f:
                 session_data = json.load(f)
-            session.current_block_idx = session_data.get("current_block_idx", 0)
+            restored_idx = session_data.get("current_block_idx", 0)
+            if 0 <= restored_idx < grid.num_blocks():
+                session.current_block_idx = restored_idx
 
             return session
         else:

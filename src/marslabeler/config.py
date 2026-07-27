@@ -27,10 +27,6 @@ class GeometryConfig:
 
     def validate(self) -> None:
         """Ensure geometry constraints."""
-        if self.block_size % 32 != 0:
-            raise ValueError(
-                f"block_size ({self.block_size}) must be a multiple of 32 (model stride)"
-            )
         if self.panel_size % self.block_size != 0:
             raise ValueError(
                 f"block_size ({self.block_size}) must divide panel_size ({self.panel_size})"

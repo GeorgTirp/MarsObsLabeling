@@ -18,6 +18,17 @@ def main():
         help="Path to app config (default: configs/app.yaml)",
     )
     parser.add_argument(
+        "--resolution",
+        type=float,
+        default=None,
+        metavar="METERS",
+        help=(
+            "Classification tile resolution in meters/tile-side (e.g. 1.0). "
+            "Converted to a pixel block size using the observation's native GSD "
+            "(default: block_size from the app config, unchanged)"
+        ),
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version="%(prog)s 0.1.0",
@@ -45,7 +56,7 @@ def main():
             Path(__file__).parent.parent.parent / "configs/app.yaml",
         ]
         config_path = next((p for p in potential_paths if p.exists()), Path("configs/app.yaml"))
-    window = MainWindow(config_path)
+    window = MainWindow(config_path, resolution_m=args.resolution)
     window.show()
 
     if args.jp2_path:

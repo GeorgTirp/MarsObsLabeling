@@ -1,5 +1,6 @@
 """Main window: ties together all UI components."""
 
+import traceback
 from pathlib import Path
 from typing import Optional
 
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QApplication,
     QPushButton,
+    QMessageBox,
 )
 from PySide6.QtGui import QAction, QKeyEvent
 
@@ -39,7 +41,11 @@ from marslabeler.model.export import export_coarse_geotiff, export_class_metadat
 class MainWindow(QMainWindow):
     """Main application window."""
 
-    def __init__(self, config_path: Path = None):
+    # Above this total block count, warn before loading (fine --resolution values
+    # can produce millions of tiles: slow to build, heavy to render, tedious to label).
+    TILE_COUNT_WARN_THRESHOLD = 1_000_000
+
+    def __init__(self, config_path: Path = None, resolution_m: Optional[float] = None):
         super().__init__()
         self.setWindowTitle("Mars Obs Labeler")
         self.setGeometry(100, 100, 1920, 1080)
@@ -48,6 +54,14 @@ class MainWindow(QMainWindow):
         if config_path is None:
             config_path = Path("configs/app.yaml")
         self.config = load_config(config_path)
+
+        # Optional classification tile resolution override (meters/tile-side), from
+        # --resolution. None -> use config.geometry.block_size unchanged.
+        self.resolution_m = resolution_m
+
+        # Where labels are saved to / resumed from. Starts at the config default;
+        # changeable via File -> Set Labels Folder... (applies to the next Open).
+        self.labels_dir = Path(self.config.paths.labels_dir)
 
         # State
         self.session: Optional[Session] = None
@@ -151,6 +165,10 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._on_open_file)
         file_menu.addAction(open_action)
 
+        self.labels_folder_action = QAction("Set Labels Folder...", self)
+        self.labels_folder_action.triggered.connect(self._on_set_labels_folder)
+        file_menu.addAction(self.labels_folder_action)
+
         self.export_action = QAction("Export Labels...", self)
         self.export_action.triggered.connect(self._export)
         self.export_action.setEnabled(False)
@@ -176,6 +194,29 @@ class MainWindow(QMainWindow):
 
         self._load_observation(Path(path))
 
+    def _on_set_labels_folder(self):
+        """File→Set Labels Folder: choose where labels are saved to / resumed from."""
+        path = QFileDialog.getExistingDirectory(
+            self,
+            "Select Labels Folder",
+            str(self.labels_dir),
+        )
+        if not path:
+            return
+
+        self.labels_dir = Path(path)
+        if self.session is not None:
+            # A session is already open; saves now target the new folder. It does not
+            # retroactively pull in labels there — reopen the image to resume those.
+            QMessageBox.information(
+                self,
+                "Labels folder changed",
+                f"Labels will now be saved to:\n{self.labels_dir}\n\n"
+                "To resume labels already stored there, reopen the observation "
+                "(File → Open JP2).",
+            )
+        self.status_label.setText(f"Labels folder: {self.labels_dir}")
+
     def _load_observation(self, jp2_path: Path):
         """Load a JP2 observation and create a session."""
         try:
@@ -183,12 +224,100 @@ class MainWindow(QMainWindow):
             raster = RasterSource(jp2_path)
             raster.open()
 
+            # Classification tile size: derive from --resolution (meters/tile-side) and
+            # the observation's native GSD if given, else fall back to the configured
+            # pixel block_size unchanged.
+            panel_size = self.config.geometry.panel_size
+            if self.resolution_m is not None:
+                block_size = max(1, round(self.resolution_m / raster.gsd))
+                # Panels must tile into whole blocks; the derived block size rarely
+                # divides the configured panel exactly, so shrink the panel to the
+                # nearest whole multiple of it (no partial blocks dropped at edges).
+                panel_size = max(block_size, (panel_size // block_size) * block_size)
+                self.status_label.setText(
+                    f"Tile: {block_size}px "
+                    f"({block_size * raster.gsd:g} m/side at {raster.gsd:g} m/px)"
+                )
+            else:
+                block_size = self.config.geometry.block_size
+
+            # Reconcile with any saved labels for this observation: they may have been
+            # made for a different image (wrong picture) or a different tile resolution.
+            obs_id = jp2_path.stem
+            saved = Session.read_saved_metadata(self.labels_dir, obs_id)
+            if saved is not None:
+                # Wrong-picture guard: saved image dimensions differ from this raster.
+                saved_w, saved_h = saved.get("img_width"), saved.get("img_height")
+                if (
+                    saved_w is not None
+                    and saved_h is not None
+                    and (saved_w != raster.width or saved_h != raster.height)
+                ):
+                    reply = QMessageBox.warning(
+                        self,
+                        "Labels may be for a different image",
+                        f"Saved labels in\n{self.labels_dir}\n"
+                        f"were made for a {saved_w}×{saved_h} px image, but "
+                        f"'{jp2_path.name}' is {raster.width}×{raster.height} px.\n\n"
+                        "You may have opened the wrong image, or pointed at the wrong "
+                        "labels folder. Loading anyway will almost certainly misalign "
+                        "the existing labels.\n\nLoad anyway?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        self.status_label.setText("Loading cancelled")
+                        raster.close()
+                        return
+
+                # Wrong-resolution guard: adopt the saved tile geometry so the existing
+                # labels line up (the requested --resolution is ignored for this image).
+                saved_block, saved_panel = saved.get("block_size"), saved.get("panel_size")
+                if (
+                    saved_block is not None
+                    and saved_panel is not None
+                    and (saved_block != block_size or saved_panel != panel_size)
+                ):
+                    QMessageBox.information(
+                        self,
+                        "Resuming at saved resolution",
+                        f"Saved labels for '{obs_id}' use {saved_block}px tiles "
+                        f"({saved_block * raster.gsd:g} m), but this run requested "
+                        f"{block_size}px ({block_size * raster.gsd:g} m).\n\n"
+                        "Loading at the saved resolution so the existing labels align. "
+                        "To label at the requested resolution instead, choose a "
+                        "different labels folder or remove the saved files first.",
+                    )
+                    block_size, panel_size = saved_block, saved_panel
+
+            # Warn before committing to an impractically large tile count (mirrors the
+            # Grid's own block-indexing: full blocks_per_panel for every panel).
+            panels_across = (raster.width + panel_size - 1) // panel_size
+            panels_down = (raster.height + panel_size - 1) // panel_size
+            blocks_per_panel = (panel_size // block_size) ** 2
+            total_blocks = panels_across * panels_down * blocks_per_panel
+            if total_blocks > self.TILE_COUNT_WARN_THRESHOLD:
+                reply = QMessageBox.warning(
+                    self,
+                    "Large tile count",
+                    f"This resolution produces {total_blocks:,} tiles "
+                    f"({blocks_per_panel:,} per panel, {block_size}px each).\n\n"
+                    "Loading may be slow and there will be a lot of tiles to label. "
+                    "Continue?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self.status_label.setText("Loading cancelled")
+                    raster.close()
+                    return
+
             # Create grid
             grid = Grid(
                 img_width=raster.width,
                 img_height=raster.height,
-                panel_size=self.config.geometry.panel_size,
-                block_size=self.config.geometry.block_size,
+                panel_size=panel_size,
+                block_size=block_size,
                 obs_id=jp2_path.stem,
                 transform=raster.transform,
                 crs=raster.crs,
@@ -199,12 +328,11 @@ class MainWindow(QMainWindow):
             self._resolve_na_class()
 
             # Create or load session
-            labels_dir = Path(self.config.paths.labels_dir)
             self.session = Session.load_or_create(
                 jp2_path,
                 grid,
                 self.config.to_dict(),
-                labels_dir,
+                self.labels_dir,
                 labeler=self.config.labeler or "unknown",
             )
 
@@ -266,7 +394,15 @@ class MainWindow(QMainWindow):
             self.status_label.setText(f"Loaded: {jp2_path.stem}")
 
         except Exception as e:
+            # Surface the failure instead of silently leaving a blank "(No session)"
+            # window; keep the full traceback on stderr for debugging.
+            traceback.print_exc()
             self.status_label.setText(f"Error: {str(e)}")
+            QMessageBox.critical(
+                self,
+                "Could not load observation",
+                f"Failed to load {jp2_path.name}:\n\n{e}",
+            )
 
     def _update_history_panel(self):
         """Swap the history placeholder for the real panel (by reference)."""
@@ -824,8 +960,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            labels_dir = Path(self.config.paths.labels_dir)
-            self.session.save_session(labels_dir)
+            self.session.save_session(self.labels_dir)
             self.controller.reset_autosave()
             self.status_label.setText(f"Auto-saved (panel {self.current_panel_idx})")
         except Exception as e:
@@ -898,8 +1033,7 @@ class MainWindow(QMainWindow):
         if not self.session:
             return
         try:
-            labels_dir = Path(self.config.paths.labels_dir)
-            self.session.save_session(labels_dir)
+            self.session.save_session(self.labels_dir)
             if self.controller:
                 self.controller.reset_autosave()
             msg = "Saved" if not note else f"Saved ({note})"

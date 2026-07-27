@@ -49,8 +49,6 @@ class Grid:
         self.crs = crs
 
         # Validate constraints
-        if block_size % 32 != 0:
-            raise ValueError(f"block_size must be multiple of 32, got {block_size}")
         if panel_size % block_size != 0:
             raise ValueError(
                 f"block_size ({block_size}) must divide panel_size ({panel_size})"

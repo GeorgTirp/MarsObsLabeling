@@ -24,22 +24,21 @@ def test_config_file_not_found():
         load_config("nonexistent_config.yaml")
 
 
-def test_geometry_validation_block_size_not_multiple_of_32(tmp_config_dir):
-    """Test that block_size must be multiple of 32."""
+def test_geometry_validation_block_size_need_not_be_multiple_of_32(tmp_config_dir):
+    """block_size is unconstrained by 32 (dropped: no model requires stride-32 tiles)."""
     config_path = tmp_config_dir / "app.yaml"
     content = config_path.read_text()
-    content = content.replace("block_size: 512", "block_size: 511")
+    content = content.replace("block_size: 512", "block_size: 4")
     config_path.write_text(content)
 
-    with pytest.raises(ValueError, match="must be a multiple of 32"):
-        load_config(config_path)
+    config = load_config(config_path)
+    assert config.geometry.block_size == 4
 
 
 def test_geometry_validation_block_size_divides_panel_size(tmp_config_dir):
     """Test that block_size must divide panel_size evenly."""
     config_path = tmp_config_dir / "app.yaml"
     content = config_path.read_text()
-    # Use 256 (multiple of 32) but doesn't divide 4096 evenly
     content = content.replace("block_size: 512", "block_size: 256")
     content = content.replace("panel_size: 4096", "panel_size: 1500")
     config_path.write_text(content)

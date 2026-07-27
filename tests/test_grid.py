@@ -51,10 +51,11 @@ def test_grid_multi_panel_dimensions(multi_panel_grid):
     assert multi_panel_grid.panels_down == 2
 
 
-def test_block_size_must_be_multiple_of_32():
-    """Test that block_size validation fails for non-multiples of 32."""
-    with pytest.raises(ValueError, match="multiple of 32"):
-        Grid(4096, 4096, 4096, 511, "OBS", Affine.identity())
+def test_block_size_need_not_be_multiple_of_32():
+    """block_size is unconstrained by 32 (dropped: no model requires stride-32 tiles)."""
+    grid = Grid(64, 64, 64, 4, "OBS", Affine.identity())
+    assert grid.block_size == 4
+    assert grid.blocks_per_panel == 16 * 16
 
 
 def test_block_size_must_divide_panel_size():

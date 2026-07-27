@@ -245,3 +245,42 @@ def test_load_or_create_existing(synthetic_geotiff, tmp_path, test_config):
     assert loaded_session.current_block_idx == 7
     # Should have the label
     assert loaded_session.labels.count_labeled() == 1
+
+
+def test_saved_metadata_records_geometry_and_dims(test_session, tmp_path):
+    """save_session records tile geometry and image dims for later resume checks."""
+    test_session.save_session(tmp_path)
+
+    meta = Session.read_saved_metadata(tmp_path, "TEST_OBS")
+    assert meta is not None
+    assert meta["obs_id"] == "TEST_OBS"
+    assert meta["block_size"] == test_session.grid.block_size
+    assert meta["panel_size"] == test_session.grid.panel_size
+    assert meta["img_width"] == test_session.grid.img_width
+    assert meta["img_height"] == test_session.grid.img_height
+
+
+def test_read_saved_metadata_missing_returns_none(tmp_path):
+    """No saved files (or only one of the pair) -> not resumable."""
+    assert Session.read_saved_metadata(tmp_path, "NOPE") is None
+
+
+def test_load_or_create_clamps_out_of_range_cursor(
+    synthetic_geotiff, tmp_path, test_config
+):
+    """A stale cursor index beyond the grid must not be restored verbatim."""
+    grid = Grid(4096, 4096, 4096, 512, "TEST_OBS", Affine.identity())
+
+    raster = RasterSource(synthetic_geotiff)
+    raster.open()
+    session = Session(raster, grid, LabelStore(grid, "test_user"), test_config)
+    session.current_block_idx = grid.num_blocks() + 999  # out of range
+    session.save_session(tmp_path)
+    raster.close()
+
+    loaded = Session.load_or_create(
+        synthetic_geotiff, grid, test_config, tmp_path, "test_user"
+    )
+    # Clamped back to the safe default rather than an invalid index
+    assert loaded.current_block_idx == 0
+    assert 0 <= loaded.current_block_idx < grid.num_blocks()
