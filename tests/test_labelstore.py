@@ -178,6 +178,38 @@ def test_class_counts(test_store):
     assert counts[1] == 3
 
 
+def test_seed_bulk_sets_labels_without_undo_or_edit_count(test_store):
+    """seed_bulk (model predictions) bypasses undo and leaves edit_count at 0."""
+    blocks = list(test_store.records.keys())
+
+    changed = test_store.seed_bulk(
+        {blocks[0]: 0, blocks[1]: 1}, class_names={0: "Class A", 1: "Class B"}
+    )
+
+    assert changed == 2
+    rec0 = test_store.get_record(blocks[0])
+    assert rec0.class_id == 0
+    assert rec0.class_name == "Class A"
+    assert rec0.status == "labeled"
+    assert rec0.edit_count == 0
+    assert test_store.undo_stack == []
+
+    # A later human edit is distinguishable via edit_count.
+    test_store.assign(blocks[0], 1, "Class B")
+    assert test_store.get_record(blocks[0]).edit_count == 1
+
+
+def test_seed_bulk_ignores_unknown_block_ids(test_store):
+    changed = test_store.seed_bulk({"not-a-real-block": 0}, class_names={0: "Class A"})
+    assert changed == 0
+
+
+def test_seed_bulk_negative_class_id_is_abstain(test_store):
+    block_id = list(test_store.records.keys())[0]
+    test_store.seed_bulk({block_id: -1}, class_names={-1: "Abstain"})
+    assert test_store.get_record(block_id).status == "abstain"
+
+
 def test_parquet_round_trip(test_store, test_grid, tmp_path):
     """Test saving and loading from Parquet."""
     blocks = list(test_store.records.keys())

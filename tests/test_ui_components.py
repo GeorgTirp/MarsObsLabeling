@@ -115,6 +115,33 @@ def test_panel_canvas_set_label_overlay(qapp):
     assert canvas.label_overlay_item is not None
 
 
+def test_panel_canvas_set_scalar_overlay(qapp):
+    """Test setting a continuous-value (uncertainty) heatmap overlay."""
+    canvas = PanelCanvas()
+    canvas.set_grid(8, 8)
+
+    values = np.full((8, 8), np.nan, dtype=np.float32)
+    values[0, 0] = 0.1
+    values[1, 1] = 0.9
+    canvas.set_scalar_overlay(values)
+
+    assert canvas.label_overlay_item is not None
+
+
+def test_panel_canvas_scalar_overlay_reuses_label_overlay_slot(qapp):
+    """Toggling between class-color and heatmap overlays swaps the same item."""
+    canvas = PanelCanvas()
+    canvas.set_grid(8, 8)
+
+    canvas.set_label_overlay(np.zeros((8, 8), dtype=np.int16), {0: "#FF0000"})
+    item_after_class = canvas.label_overlay_item
+
+    canvas.set_scalar_overlay(np.zeros((8, 8), dtype=np.float32))
+    item_after_scalar = canvas.label_overlay_item
+
+    assert item_after_class is item_after_scalar  # same QGraphicsPixmapItem, repainted
+
+
 def test_panel_canvas_highlight(qapp):
     """Test setting current block highlight."""
     canvas = PanelCanvas()
@@ -154,6 +181,26 @@ def test_legend_panel_creation(qapp, tmp_config_dir):
     legend = LegendPanel(classes_scheme)
 
     assert legend is not None
+
+
+def test_legend_panel_has_summary_button(qapp, tmp_config_dir):
+    """LegendPanel exposes a Summary button in the bottom-right corner."""
+    classes_scheme = load_classes(tmp_config_dir / "classes.yaml")
+    legend = LegendPanel(classes_scheme)
+
+    assert legend.summary_button is not None
+    assert legend.on_summary_clicked is None  # wired up by MainWindow, not by default
+
+
+def test_legend_panel_summary_button_invokes_callback(qapp, tmp_config_dir):
+    classes_scheme = load_classes(tmp_config_dir / "classes.yaml")
+    legend = LegendPanel(classes_scheme)
+
+    calls = []
+    legend.on_summary_clicked = lambda: calls.append(1)
+    legend.summary_button.click()
+
+    assert calls == [1]
 
 
 def test_history_panel_creation(qapp, test_grid, test_store):

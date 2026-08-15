@@ -136,6 +136,59 @@ def create_block_overlay(
     return pixmap
 
 
+def value_to_heatmap_color(value: float) -> QColor:
+    """Map a [0,1] scalar to blue(low) -> yellow(mid) -> red(high)."""
+    v = max(0.0, min(1.0, value))
+    if v < 0.5:
+        t = v / 0.5
+        r, g, b = int(255 * t), int(255 * t), int(255 * (1 - t))
+    else:
+        t = (v - 0.5) / 0.5
+        r, g, b = 255, int(255 * (1 - t)), 0
+    return QColor(r, g, b)
+
+
+def create_heatmap_overlay(
+    width: int,
+    height: int,
+    block_width: int,
+    block_height: int,
+    block_values: np.ndarray,  # 2D float array in [0,1]; NaN = no value (left uncolored)
+    alpha: float = 0.5,
+) -> QPixmap:
+    """
+    Create a continuous-value heatmap overlay (e.g. uncertainty), one flat color per block.
+
+    Args:
+        width, height: Total canvas size
+        block_width, block_height: Size of each block in pixels
+        block_values: 2D array of scores in [0, 1]; NaN cells are left transparent
+        alpha: Alpha blend factor (0-1)
+
+    Returns:
+        QPixmap with transparent background and colored blocks
+    """
+    pixmap = QPixmap(width, height)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setOpacity(alpha)
+
+    for row in range(block_values.shape[0]):
+        for col in range(block_values.shape[1]):
+            value = block_values[row, col]
+            if np.isnan(value):
+                continue
+
+            brush = QBrush(value_to_heatmap_color(float(value)))
+            x = col * block_width
+            y = row * block_height
+            painter.fillRect(x, y, block_width, block_height, brush)
+
+    painter.end()
+    return pixmap
+
+
 def create_current_block_highlight(
     width: int,
     height: int,

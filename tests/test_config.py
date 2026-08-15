@@ -55,3 +55,34 @@ def test_path_resolution(tmp_config_dir):
     # Paths should be absolute after loading
     assert Path(config.paths.classes_file).is_absolute()
     assert Path(config.paths.labels_dir).is_absolute()
+
+
+def test_predictions_dir_defaults_and_resolves(tmp_config_dir):
+    """predictions_dir is optional (old configs lack it) and resolves like labels_dir."""
+    config_path = tmp_config_dir / "app.yaml"
+    config = load_config(config_path)
+
+    assert Path(config.paths.predictions_dir).is_absolute()
+    assert Path(config.paths.predictions_dir).name == "predictions"
+
+
+def test_inference_config_defaults_when_absent(tmp_config_dir):
+    """configs without an `inference:` section (mars-label only) still load fine."""
+    config_path = tmp_config_dir / "app.yaml"
+    config = load_config(config_path)
+
+    assert config.inference.device == "auto"
+    assert config.inference.batch_size == 4
+    assert config.inference.ai4exomars_path is None
+
+
+def test_inference_config_overrides(tmp_config_dir):
+    """An explicit `inference:` section overrides the defaults."""
+    config_path = tmp_config_dir / "app.yaml"
+    content = config_path.read_text()
+    content += "\ninference:\n  device: cpu\n  batch_size: 8\n"
+    config_path.write_text(content)
+
+    config = load_config(config_path)
+    assert config.inference.device == "cpu"
+    assert config.inference.batch_size == 8

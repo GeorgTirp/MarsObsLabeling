@@ -17,6 +17,10 @@ class TerrainClass:
     name: str
     color: str
     hotkey: str | None = None
+    # Channel index this class corresponds to in a model's output logits (mars-inference
+    # only). Defaults to `id` when unset -- fine as long as classes.yaml ids are already
+    # the 0-based contiguous indices the model was trained against.
+    model_index: int | None = None
 
     def validate_color(self) -> None:
         """Ensure color is valid hex."""
@@ -100,6 +104,26 @@ class ClassScheme:
             return self.nodata.color
         raise ValueError(f"Unknown class ID: {class_id}")
 
+    def model_index_to_id(self) -> dict[int, int]:
+        """Map a model's output channel index (0-based) -> classes.yaml class id.
+
+        Uses each class's explicit `model_index` when set, else falls back to its
+        `id` (correct only when ids already are the model's 0-based contiguous
+        channel indices). Used by mars-inference to translate argmax predictions.
+        """
+        mapping: dict[int, int] = {}
+        for cls in self.classes.values():
+            model_idx = cls.model_index if cls.model_index is not None else cls.id
+            if model_idx in mapping:
+                other_id = mapping[model_idx]
+                other_name = self.classes[other_id].name
+                raise ValueError(
+                    f'model_index {model_idx} is used by both "{cls.name}" and '
+                    f'"{other_name}" -- set an explicit, distinct model_index on each'
+                )
+            mapping[model_idx] = cls.id
+        return mapping
+
 
 def load_classes(yaml_path: str | Path) -> ClassScheme:
     """Load and validate class scheme from YAML."""
@@ -118,6 +142,7 @@ def load_classes(yaml_path: str | Path) -> ClassScheme:
             name=item["name"],
             color=item.get("color", "#808080"),
             hotkey=item.get("hotkey"),
+            model_index=item.get("model_index"),
         )
         classes[cls.id] = cls
 

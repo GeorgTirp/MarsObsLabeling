@@ -209,8 +209,12 @@ class Session:
         self.label_count_since_autosave = 0
         self.last_label_time = time.time()
 
-    def save_session(self, labels_dir: Path) -> None:
-        """Save labels and session state."""
+    def save_session(self, labels_dir: Path, extra_meta: Optional[dict] = None) -> None:
+        """Save labels and session state.
+
+        extra_meta is merged into the saved session JSON (e.g. mars-inference stores
+        model provenance there) and is returned as-is by read_saved_metadata.
+        """
         labels_dir = Path(labels_dir)
         labels_dir.mkdir(parents=True, exist_ok=True)
 
@@ -230,6 +234,8 @@ class Session:
             "img_height": self.grid.img_height,
             "timestamp": int(time.time() * 1000),
         }
+        if extra_meta:
+            session_data.update(extra_meta)
         session_path = labels_dir / f"{self.grid.obs_id}.session.json"
         with open(session_path, "w") as f:
             json.dump(session_data, f, indent=2)

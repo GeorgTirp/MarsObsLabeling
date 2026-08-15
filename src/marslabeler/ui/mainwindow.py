@@ -45,7 +45,12 @@ class MainWindow(QMainWindow):
     # can produce millions of tiles: slow to build, heavy to render, tedious to label).
     TILE_COUNT_WARN_THRESHOLD = 1_000_000
 
-    def __init__(self, config_path: Path = None, resolution_m: Optional[float] = None):
+    def __init__(
+        self,
+        config_path: Path = None,
+        resolution_m: Optional[float] = None,
+        predictions_mode: bool = False,
+    ):
         super().__init__()
         self.setWindowTitle("Mars Obs Labeler")
         self.setGeometry(100, 100, 1920, 1080)
@@ -54,6 +59,23 @@ class MainWindow(QMainWindow):
         if config_path is None:
             config_path = Path("configs/app.yaml")
         self.config = load_config(config_path)
+
+        # Predictions mode (mars-inference): labels_dir points at a per-model predictions
+        # cache instead of the configured labels folder, and a Save Predictions button
+        # persists them explicitly (see load_for_inference()). Otherwise this is exactly
+        # the labeling window -- predicted blocks are edited with the same hotkeys.
+        self.predictions_mode = predictions_mode
+        self.model_path: Optional[Path] = None
+        self._model_sig: Optional[str] = None
+
+        # Analysis layers (mars-inference): which overlay the canvas is showing, and
+        # the per-block data behind it. All empty/None until inference actually runs
+        # (or, for npca_gallery, until a calibration artifact is found) -- see
+        # load_for_inference(), _run_prediction(), _toggle_uncertainty_layer().
+        self.display_layer = "classes"  # "classes" | "uncertainty"
+        self.block_confidence: dict[str, float] = {}  # block_id -> mean softmax confidence
+        self.block_uncertainty: dict[str, float] = {}  # block_id -> mean epistemic (Mahalanobis) uncertainty
+        self.npca_gallery: Optional[dict] = None  # class model_index -> component -> ranked thumbnails
 
         # Optional classification tile resolution override (meters/tile-side), from
         # --resolution. None -> use config.geometry.block_size unchanged.
@@ -134,6 +156,15 @@ class MainWindow(QMainWindow):
         self.overview_button.clicked.connect(self._toggle_overview)
         right_layout.addWidget(self.overview_button)
 
+        # Only shown in predictions mode (mars-inference): toggles the class-color
+        # overlay for a Mahalanobis-distance epistemic-uncertainty heatmap.
+        self.uncertainty_button = QPushButton("\U0001F321 Uncertainty Heatmap")
+        self.uncertainty_button.setEnabled(False)
+        self.uncertainty_button.setCheckable(True)
+        self.uncertainty_button.setVisible(self.predictions_mode)
+        self.uncertainty_button.clicked.connect(self._toggle_uncertainty_layer)
+        right_layout.addWidget(self.uncertainty_button)
+
         self.next_panel_button = QPushButton("Next Panel ▶  (fills rest as NA)")
         self.next_panel_button.setEnabled(False)
         self.next_panel_button.clicked.connect(self._go_to_next_panel)
@@ -143,6 +174,13 @@ class MainWindow(QMainWindow):
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._export)
         right_layout.addWidget(self.export_button)
+
+        # Only shown in predictions mode (mars-inference)
+        self.save_predictions_button = QPushButton("\U0001F4BE Save Predictions")
+        self.save_predictions_button.setEnabled(False)
+        self.save_predictions_button.setVisible(self.predictions_mode)
+        self.save_predictions_button.clicked.connect(self._save_predictions)
+        right_layout.addWidget(self.save_predictions_button)
 
         right_widget = QWidget()
         right_widget.setLayout(right_layout)
@@ -219,6 +257,18 @@ class MainWindow(QMainWindow):
 
     def _load_observation(self, jp2_path: Path):
         """Load a JP2 observation and create a session."""
+        if self.predictions_mode:
+            # A new image invalidates any analysis layers computed for the previous
+            # one (load_for_inference() repopulates block_confidence/npca_gallery
+            # for its own image+model pair right after this call; a plain File ->
+            # Open of a different image while already in predictions mode has no
+            # such follow-up, so drop the stale data here rather than mislabel it).
+            self.display_layer = "classes"
+            self.block_confidence = {}
+            self.block_uncertainty = {}
+            self.uncertainty_button.setChecked(False)
+            self.uncertainty_button.setEnabled(False)
+
         try:
             # Open raster
             raster = RasterSource(jp2_path)
@@ -354,6 +404,7 @@ class MainWindow(QMainWindow):
             if preprocess_dialog.exec() != QDialog.DialogCode.Accepted:
                 self.status_label.setText("Loading cancelled")
                 raster.close()
+                self.session = None
                 return
 
             # Store skip decisions for later use
@@ -398,11 +449,221 @@ class MainWindow(QMainWindow):
             # window; keep the full traceback on stderr for debugging.
             traceback.print_exc()
             self.status_label.setText(f"Error: {str(e)}")
+            self.session = None
             QMessageBox.critical(
                 self,
                 "Could not load observation",
                 f"Failed to load {jp2_path.name}:\n\n{e}",
             )
+
+    # ------------------------------------------------------------------ #
+    # Predictions mode (mars-inference): model-seeded session + explicit save
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _model_signature(model_path: Path) -> str:
+        """Cheap fingerprint of a checkpoint file, to detect a changed model on reload."""
+        stat = model_path.stat()
+        return f"{stat.st_size}_{int(stat.st_mtime)}"
+
+    def load_for_inference(self, jp2_path: Path, model_path: Path) -> None:
+        """Open jp2_path in predictions mode: reuse cached predictions for this exact
+        model if present, otherwise run inference (with a progress dialog) and seed
+        them into a fresh session. Requires predictions_mode=True.
+        """
+        if not self.predictions_mode:
+            raise RuntimeError("load_for_inference requires predictions_mode=True")
+
+        self.model_path = model_path
+        model_id = model_path.stem
+        self.labels_dir = Path(self.config.paths.predictions_dir) / model_id
+        self.config.labeler = f"model:{model_id}"
+        self.setWindowTitle(f"Mars Obs Labeler — Predictions [{model_id}] — {jp2_path.name}")
+
+        # Fresh observation -> analysis layers from any previous one are stale.
+        self.display_layer = "classes"
+        self.block_confidence = {}
+        self.block_uncertainty = {}
+        self.uncertainty_button.setChecked(False)
+        self.npca_gallery = self._try_load_npca_gallery(model_path)
+
+        model_sig = self._model_signature(model_path)
+        obs_id = jp2_path.stem
+        saved = Session.read_saved_metadata(self.labels_dir, obs_id)
+        cache_valid = saved is not None and saved.get("model_sig") == model_sig
+        if saved is not None and not cache_valid:
+            QMessageBox.information(
+                self,
+                "Cached predictions are stale",
+                f"Predictions saved in\n{self.labels_dir}\n"
+                "were made with a different version of this checkpoint file "
+                "(size/modified time differ). Re-running inference.",
+            )
+
+        self._load_observation(jp2_path)
+        if not self.session:
+            return  # load failed or was cancelled; _load_observation already reported it
+
+        self.save_predictions_button.setEnabled(True)
+        self.uncertainty_button.setEnabled(True)
+
+        if cache_valid:
+            self._model_sig = model_sig
+            self.status_label.setText(f"Loaded cached predictions ({model_id}) for {obs_id}")
+            return
+
+        self._run_prediction(model_path, model_sig)
+
+    def _run_prediction(self, model_path: Path, model_sig: str) -> None:
+        """Run the model over every non-nodata block and seed the results as labels."""
+        from marslabeler.ui.predictdialog import PredictDialog
+
+        blocks = [
+            b
+            for b in self.session.grid.iter_blocks()
+            if self.session.labels.get_record(b.block_id).status != "nodata"
+        ]
+
+        dialog = PredictDialog(
+            self.session.raster,
+            blocks,
+            self.session.grid.block_size,
+            model_path,
+            self.classes_scheme,
+            {
+                "device": self.config.inference.device,
+                "ai4exomars_path": self.config.inference.ai4exomars_path,
+                "batch_size": self.config.inference.batch_size,
+                "context_multiplier": self.config.inference.context_multiplier,
+            },
+        )
+        dialog.start()
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            msg = f"Inference failed: {dialog.error}" if dialog.error else "Inference cancelled"
+            self.status_label.setText(msg)
+            if dialog.error:
+                QMessageBox.critical(self, "Inference failed", dialog.error)
+            return
+
+        predictions = dialog.get_predictions()
+        class_names = {cid: c.name for cid, c in self.classes_scheme.classes.items()}
+        self.session.labels.seed_bulk(predictions, class_names)
+        self.block_confidence = dialog.get_confidence()
+        self._model_sig = model_sig
+
+        self._refresh_view()
+        self._refresh_history()
+        self.status_label.setText(
+            f"Predicted {len(predictions)} blocks with {model_path.stem} -- "
+            "review, then press Save Predictions"
+        )
+
+    def _save_predictions(self) -> None:
+        """Persist the current (possibly reviewed) predictions to the predictions cache."""
+        if not self.session or not self.predictions_mode:
+            return
+        try:
+            extra_meta = {
+                "model_sig": self._model_sig,
+                "model_stem": self.model_path.stem if self.model_path else None,
+            }
+            self.session.save_session(self.labels_dir, extra_meta=extra_meta)
+            self.status_label.setText(f"Predictions saved to {self.labels_dir}")
+        except Exception as e:
+            self.status_label.setText(f"Save error: {str(e)}")
+
+    def _try_load_npca_gallery(self, model_path: Path) -> Optional[dict]:
+        """Load the model's neural-PCA gallery sidecar, if one has been fitted yet.
+
+        Returns None (rather than raising) whenever it isn't available -- missing
+        artifact, vision_backend not installed, corrupt file -- since this is a
+        purely additive analysis layer that shouldn't block predictions from
+        opening. See AI4ExoMars/vision_backend/pc_align/fit_neural_pca.py.
+        """
+        try:
+            from marslabeler.inference.modelio import sidecar_path
+            from marslabeler.inference.npca_gallery import load_npca_gallery
+
+            return load_npca_gallery(
+                sidecar_path(model_path, "npca.pt"),
+                ai4exomars_path=self.config.inference.ai4exomars_path,
+            )
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+
+    def _toggle_uncertainty_layer(self) -> None:
+        """Uncertainty Heatmap button: swap the class-color overlay for the
+        Mahalanobis epistemic-uncertainty heatmap (computing it on first use)."""
+        if not self.session:
+            self.uncertainty_button.setChecked(False)
+            return
+
+        if not self.uncertainty_button.isChecked():
+            self.display_layer = "classes"
+            self._refresh_view()
+            return
+
+        if not self.block_uncertainty:
+            self._compute_uncertainty_layer()
+
+        if self.block_uncertainty:
+            self.display_layer = "uncertainty"
+        else:
+            self.uncertainty_button.setChecked(False)
+            self.display_layer = "classes"
+        self._refresh_view()
+
+    def _compute_uncertainty_layer(self) -> None:
+        """Run the Mahalanobis uncertainty scorer over every non-nodata block."""
+        from marslabeler.ui.uncertaintydialog import UncertaintyDialog
+
+        blocks = [
+            b
+            for b in self.session.grid.iter_blocks()
+            if self.session.labels.get_record(b.block_id).status != "nodata"
+        ]
+
+        dialog = UncertaintyDialog(
+            self.session.raster,
+            blocks,
+            self.session.grid.block_size,
+            self.model_path,
+            {
+                "device": self.config.inference.device,
+                "ai4exomars_path": self.config.inference.ai4exomars_path,
+                "batch_size": self.config.inference.batch_size,
+                "context_multiplier": self.config.inference.context_multiplier,
+            },
+        )
+        dialog.start()
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.status_label.setText("Uncertainty heatmap unavailable")
+            if dialog.error:
+                QMessageBox.information(self, "Uncertainty heatmap unavailable", dialog.error)
+            return
+
+        self.block_uncertainty = dialog.get_scores()
+        self.status_label.setText(f"Computed uncertainty for {len(self.block_uncertainty)} blocks")
+
+    def _show_class_summary(self) -> None:
+        """Legend panel's Summary button: open the per-class summary window."""
+        if not self.session or not self.classes_scheme:
+            return
+        from marslabeler.ui.summarydialog import ClassSummaryDialog
+
+        dialog = ClassSummaryDialog(
+            self.classes_scheme,
+            self.session,
+            npca_gallery=self.npca_gallery,
+            block_confidence=self.block_confidence,
+            block_uncertainty=self.block_uncertainty,
+            parent=self,
+        )
+        dialog.exec()
 
     def _update_history_panel(self):
         """Swap the history placeholder for the real panel (by reference)."""
@@ -419,6 +680,7 @@ class MainWindow(QMainWindow):
     def _update_legend_panel(self):
         """Swap the legend placeholder for the real legend (by reference)."""
         legend = LegendPanel(self.classes_scheme)
+        legend.on_summary_clicked = self._show_class_summary
         old_item = self.right_layout.replaceWidget(self.legend_panel, legend)
         if old_item is not None and old_item.widget() is not None:
             old_item.widget().deleteLater()
@@ -550,10 +812,22 @@ class MainWindow(QMainWindow):
         return colors
 
     def _refresh_label_overlay(self) -> None:
-        """Rebuild only the colored block overlay (no raster re-read)."""
+        """Rebuild only the colored/heatmap block overlay (no raster re-read)."""
         if not self.session:
             return
         grid = self.session.grid
+
+        if self.display_layer == "uncertainty":
+            values = np.full(
+                (grid.blocks_per_panel_row, grid.blocks_per_panel_col), np.nan, dtype=np.float32
+            )
+            for block in grid.get_panel_blocks(self.current_panel_idx):
+                score = self.block_uncertainty.get(block.block_id)
+                if score is not None:
+                    values[block.block_row, block.block_col] = score
+            self.canvas.set_scalar_overlay(values)
+            return
+
         block_data = np.full(
             (grid.blocks_per_panel_row, grid.blocks_per_panel_col), -3, dtype=np.int16
         )

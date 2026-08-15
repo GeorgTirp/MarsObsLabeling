@@ -1,16 +1,36 @@
 # Terrain class legend for Mars observations
 # id MUST be a stable small int >= 0; never renumber existing ids.
 # hotkey: a single character; must be unique across classes.
+# model_index (optional, mars-inference only): the channel index this class
+# corresponds to in a model's output logits, if different from `id`.
+#
+# This is the NOAH-H "DC" (surface-texture) legend that
+# checkpoints/stage3_segmentation_best.pt was trained on (see
+# AI4ExoMars/data/2022-02-08_ABarrett_OU_HiRISE_NOAH-H_Mosaic/derived/classes_DC.json).
+# Its ids there are 1-based (1..14); seg_dataset.py remaps labels 1..C -> 0..C-1
+# for training, so id here = classes_DC.json id - 1 = the model's 0-based
+# channel index, and no explicit model_index override is needed.
 classes:
-  - { id: 0,  name: "Bedrock",     color: "#4C72B0", hotkey: "q" }
-  - { id: 1,  name: "Sand",        color: "#D4A574", hotkey: "w" }
-  - { id: 2,  name: "Not Available", color: "#808080", hotkey: "e" }
+  - { id: 0,  name: "Smooth + Featureless",                              color: "#00ff00", hotkey: "q" }
+  - { id: 1,  name: "Smooth + Lineated",                                 color: "#00aa00", hotkey: "w" }
+  - { id: 2,  name: "Textured non-bedrock",                              color: "#005a00", hotkey: "e" }
+  - { id: 3,  name: "Smooth bedrock",                                    color: "#ff0000", hotkey: "r" }
+  - { id: 4,  name: "Textured bedrock",                                  color: "#aa0000", hotkey: "t" }
+  - { id: 5,  name: "Rugged bedrock",                                    color: "#ffff00", hotkey: "y" }
+  - { id: 6,  name: "Fractured bedrock",                                 color: "#87005a", hotkey: "u" }
+  - { id: 7,  name: "Continuous + Simple form large ripples",            color: "#0000ff", hotkey: "i" }
+  - { id: 8,  name: "Isolated + Simple form large ripples",              color: "#ff9600", hotkey: "o" }
+  - { id: 9,  name: "Rectilinear form large ripples",                    color: "#cdcdcd", hotkey: "p" }
+  - { id: 10, name: "Continuous small ripples",                          color: "#00ffff", hotkey: "a" }
+  - { id: 11, name: "Bedrock substrate + Non-continuous small ripples",  color: "#5a0000", hotkey: "s" }
+  - { id: 12, name: "Non-bedrock substrate + Non-continuous small ripples", color: "#007dff", hotkey: "d" }
+  - { id: 13, name: "Boulder fields",                                    color: "#000000", hotkey: "f" }
 
 # Reserved, not user-assignable via class hotkeys:
 abstain:
   id: -1
   name: "Abstain"
-  color: "#000000"
+  color: "#808080"
   hotkey: "space"
 
 nodata:

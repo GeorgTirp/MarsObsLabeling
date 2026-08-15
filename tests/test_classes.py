@@ -101,6 +101,43 @@ def test_get_color(tmp_config_dir):
     assert scheme.get_color(-1) == "#000000"
 
 
+def test_model_index_to_id_defaults_to_class_id(tmp_config_dir):
+    """Without an explicit model_index, a class's own id is used as the channel index."""
+    classes_path = tmp_config_dir / "classes.yaml"
+    scheme = load_classes(classes_path)
+
+    assert scheme.model_index_to_id() == {0: 0, 1: 1}
+
+
+def test_model_index_to_id_explicit_mapping(tmp_config_dir):
+    """An explicit model_index overrides the default identity mapping."""
+    classes_path = tmp_config_dir / "classes.yaml"
+    content = classes_path.read_text()
+    content = content.replace(
+        '{ id: 0,  name: "Class A", color: "#4C72B0", hotkey: "q" }',
+        '{ id: 0,  name: "Class A", color: "#4C72B0", hotkey: "q", model_index: 5 }',
+    )
+    classes_path.write_text(content)
+    scheme = load_classes(classes_path)
+
+    assert scheme.model_index_to_id() == {5: 0, 1: 1}
+
+
+def test_model_index_to_id_collision_raises(tmp_config_dir):
+    """Two classes mapped to the same model_index is a configuration error."""
+    classes_path = tmp_config_dir / "classes.yaml"
+    content = classes_path.read_text()
+    content = content.replace(
+        '{ id: 1,  name: "Class B", color: "#DD8452", hotkey: "w" }',
+        '{ id: 1,  name: "Class B", color: "#DD8452", hotkey: "w", model_index: 0 }',
+    )
+    classes_path.write_text(content)
+    scheme = load_classes(classes_path)
+
+    with pytest.raises(ValueError, match="model_index 0"):
+        scheme.model_index_to_id()
+
+
 def test_reserved_ids_not_usable_by_classes(tmp_config_dir):
     """Test that reserved IDs (-1, -2) cannot be used by user classes."""
     classes_path = tmp_config_dir / "classes.yaml"

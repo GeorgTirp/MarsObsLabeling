@@ -9,7 +9,9 @@ from marslabeler.ui.render import (
     apply_display_stretch,
     create_grid_overlay,
     create_block_overlay,
+    create_heatmap_overlay,
     create_current_block_highlight,
+    value_to_heatmap_color,
 )
 
 
@@ -72,6 +74,34 @@ def test_create_block_overlay():
     class_colors = {0: "#FF0000", 1: "#00FF00", 2: "#0000FF"}
 
     pixmap = create_block_overlay(400, 400, 200, 200, block_data, class_colors, alpha=0.4)
+
+    assert pixmap.width() == 400
+    assert pixmap.height() == 400
+
+
+def test_value_to_heatmap_color_endpoints_and_midpoint():
+    """Low -> blue, high -> red, mid -> yellow."""
+    low = value_to_heatmap_color(0.0)
+    high = value_to_heatmap_color(1.0)
+    mid = value_to_heatmap_color(0.5)
+
+    assert (low.red(), low.green(), low.blue()) == (0, 0, 255)
+    assert (high.red(), high.green(), high.blue()) == (255, 0, 0)
+    assert (mid.red(), mid.green(), mid.blue()) == (255, 255, 0)
+
+
+def test_value_to_heatmap_color_clamps_out_of_range():
+    below = value_to_heatmap_color(-0.5)
+    above = value_to_heatmap_color(1.5)
+    assert (below.red(), below.green(), below.blue()) == (0, 0, 255)
+    assert (above.red(), above.green(), above.blue()) == (255, 0, 0)
+
+
+def test_create_heatmap_overlay():
+    """Test creating a scalar heatmap overlay."""
+    block_values = np.array([[0.0, 0.5], [1.0, np.nan]], dtype=np.float32)
+
+    pixmap = create_heatmap_overlay(400, 400, 200, 200, block_values, alpha=0.5)
 
     assert pixmap.width() == 400
     assert pixmap.height() == 400

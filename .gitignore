@@ -16,9 +16,15 @@ ENV/
 # ---- Output (labels, sessions, exports) ----
 labels/
 configs/labels/
+predictions/
+configs/predictions/
 exports/
 *.parquet
 *.session.json
+
+# ---- Model checkpoints (mars-inference input, not version-controlled) ----
+*.pt
+*.pth
 
 # ---- Python ----
 __pycache__/

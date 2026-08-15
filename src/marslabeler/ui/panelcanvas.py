@@ -12,6 +12,7 @@ from marslabeler.ui.render import (
     apply_display_stretch,
     create_grid_overlay,
     create_block_overlay,
+    create_heatmap_overlay,
     create_current_block_highlight,
 )
 
@@ -126,6 +127,30 @@ class PanelCanvas(QGraphicsView):
             block_data,
             class_colors,
             alpha=0.25,
+        )
+
+        if self.label_overlay_item is None:
+            self.label_overlay_item = self.scene.addPixmap(overlay_pixmap)
+        else:
+            self.label_overlay_item.setPixmap(overlay_pixmap)
+
+    def set_scalar_overlay(self, block_values: np.ndarray, alpha: float = 0.5) -> None:
+        """
+        Set a continuous-value heatmap overlay (e.g. uncertainty), replacing whatever
+        the class-color overlay was showing in the same layer/slot.
+
+        Args:
+            block_values: 2D float array in [0,1] (blocks_per_col x blocks_per_row);
+                NaN cells are left transparent (e.g. no score computed there yet)
+            alpha: Alpha blend factor (0-1)
+        """
+        overlay_pixmap = create_heatmap_overlay(
+            self.canvas_width,
+            self.canvas_height,
+            self.block_width,
+            self.block_height,
+            block_values,
+            alpha=alpha,
         )
 
         if self.label_overlay_item is None:

@@ -79,6 +79,13 @@ class RasterSource:
         # Pixel size from affine (diagonal elements typically, take absolute value)
         return abs(self._dataset.transform.a)
 
+    @property
+    def dtype(self) -> str:
+        """Band 1's native dtype (e.g. 'uint8', 'uint16')."""
+        if self._dataset is None:
+            raise RuntimeError("Raster not open")
+        return self._dataset.dtypes[0]
+
     def detect_overviews(self) -> list[int]:
         """Detect available overview levels."""
         if self._dataset is None:

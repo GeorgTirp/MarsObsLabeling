@@ -265,6 +265,28 @@ def test_read_saved_metadata_missing_returns_none(tmp_path):
     assert Session.read_saved_metadata(tmp_path, "NOPE") is None
 
 
+def test_save_session_extra_meta_is_persisted(test_session, tmp_path):
+    """mars-inference stashes model provenance (model_sig, model_stem) via extra_meta."""
+    test_session.save_session(
+        tmp_path, extra_meta={"model_sig": "123_456", "model_stem": "stage3_segmentation"}
+    )
+
+    meta = Session.read_saved_metadata(tmp_path, "TEST_OBS")
+    assert meta["model_sig"] == "123_456"
+    assert meta["model_stem"] == "stage3_segmentation"
+    # Core fields are still present alongside the extra ones.
+    assert meta["obs_id"] == "TEST_OBS"
+
+
+def test_save_session_without_extra_meta_omits_model_fields(test_session, tmp_path):
+    """Plain mars-label saves (no extra_meta) don't gain stray model_sig/model_stem keys."""
+    test_session.save_session(tmp_path)
+
+    meta = Session.read_saved_metadata(tmp_path, "TEST_OBS")
+    assert "model_sig" not in meta
+    assert "model_stem" not in meta
+
+
 def test_load_or_create_clamps_out_of_range_cursor(
     synthetic_geotiff, tmp_path, test_config
 ):

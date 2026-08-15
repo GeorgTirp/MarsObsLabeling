@@ -217,6 +217,28 @@ class LabelStore:
             changed += 1
         return changed
 
+    def seed_bulk(self, block_class: dict[str, int], class_names: dict[int, str]) -> int:
+        """
+        Seed many blocks with predicted classes, bypassing undo and edit_count.
+
+        Used by mars-inference to populate a fresh session with model predictions --
+        this is a starting point for review, not a user edit, so edit_count stays 0
+        (any later hotkey relabel increments it, marking the block human-reviewed).
+        Returns the number of blocks actually changed.
+        """
+        now = int(time.time() * 1000)
+        changed = 0
+        for block_id, class_id in block_class.items():
+            if block_id not in self.records:
+                continue
+            record = self.records[block_id]
+            record.class_id = class_id
+            record.class_name = class_names.get(class_id, str(class_id))
+            record.status = "labeled" if class_id >= 0 else "abstain"
+            record.updated_utc = now
+            changed += 1
+        return changed
+
     def set_nodata(self, block_id: str) -> None:
         """Mark a block as nodata."""
         if block_id not in self.records:

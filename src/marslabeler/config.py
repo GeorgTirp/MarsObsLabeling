@@ -11,6 +11,7 @@ import yaml
 class PathsConfig:
     classes_file: str
     labels_dir: str
+    predictions_dir: str = "./predictions"
 
     def resolve(self, config_dir: Path) -> None:
         """Resolve relative paths relative to config directory."""
@@ -18,6 +19,8 @@ class PathsConfig:
             self.classes_file = str(config_dir / self.classes_file)
         if not Path(self.labels_dir).is_absolute():
             self.labels_dir = str(config_dir / self.labels_dir)
+        if not Path(self.predictions_dir).is_absolute():
+            self.predictions_dir = str(config_dir / self.predictions_dir)
 
 
 @dataclass
@@ -64,6 +67,19 @@ class ExportConfig:
 
 
 @dataclass
+class InferenceConfig:
+    """Settings for `mars-inference` (model loading + windowing); unused by mars-label."""
+
+    # Path to an AI4ExoMars checkout providing `vision_backend`. null -> auto-detect a
+    # sibling `../AI4ExoMars` directory next to this repo, or an already-installed package.
+    ai4exomars_path: str | None = None
+    device: str = "auto"  # auto | cpu | cuda | mps
+    batch_size: int = 4
+    # Context crop size (context-branch models only) = context_multiplier * local window size.
+    context_multiplier: int = 4
+
+
+@dataclass
 class AppConfig:
     paths: PathsConfig
     geometry: GeometryConfig
@@ -73,6 +89,7 @@ class AppConfig:
     autosave: AutosaveConfig
     export: ExportConfig
     labeler: str | None
+    inference: InferenceConfig
 
     def validate(self) -> None:
         """Run all validation checks."""
@@ -102,6 +119,7 @@ def load_config(config_path: str | Path) -> AppConfig:
         autosave=AutosaveConfig(**data["autosave"]),
         export=ExportConfig(**data["export"]),
         labeler=data.get("labeler"),
+        inference=InferenceConfig(**data.get("inference", {})),
     )
 
     config.paths.resolve(config_path.parent)

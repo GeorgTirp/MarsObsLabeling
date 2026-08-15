@@ -33,6 +33,13 @@ For development:
 pip install -e '.[dev]'
 ```
 
+For inference (`mars-inference`), on top of `[gui]`:
+```bash
+pip install -e '.[infer]'
+```
+This pulls in `torch`. It does **not** pull in the AI4ExoMars model code
+(`vision_backend`) — see [Inference](#inference-mars-inference) below.
+
 ## Quick Start
 
 ### Installation
@@ -57,6 +64,107 @@ pytest tests/ -v
 ```bash
 mars-label --help
 ```
+
+## Inference (`mars-inference`)
+
+`mars-inference` runs a trained AI4ExoMars segmentation checkpoint over a HiRISE
+observation and opens the predictions in the same window as `mars-label` — same
+panels, same grid, same hotkeys — so a prediction is just a labeling session with a
+head start. It is the ML counterpart to `mars-label`; nothing about labeling changes.
+
+```bash
+mars-inference /path/to/file.jp2 /path/to/model.pt
+```
+
+What happens:
+1. **Preprocessing** — same nodata/skip-detection pass as `mars-label` (progress bar); off-swath blocks are never sent through the model.
+2. **Inference** — the checkpoint's model is reconstructed and run block-by-block over the observation, with a progress bar (`block N/M`). Each block gets one class: the model's per-pixel argmax, majority-voted across the block.
+3. **Review** — the window opens exactly like `mars-label`, with predicted blocks pre-colored by class. Relabel any block with the normal hotkeys; a block you edit gets `edit_count > 0` in the saved Parquet, so reviewed/edited predictions stay distinguishable from untouched model output.
+4. **Save Predictions** — press the "💾 Save Predictions" button to persist the current (possibly reviewed) predictions.
+
+### Caching
+
+Predictions are saved to `configs/predictions/<model_stem>/<obs_id>.parquet` (+ a
+`.session.json` sidecar), keyed by the checkpoint's filename stem — one subfolder per
+model, so several models' predictions for the same image coexist. Re-running
+`mars-inference` on the same `(image, model)` pair loads the cached result instead of
+calling the model again; if the checkpoint file's size/mtime changed since the cache
+was written, it's treated as stale and inference reruns automatically.
+
+### Continuing in labeling mode
+
+Because predictions use the exact same Parquet + session-JSON format as labels, once
+you've saved them you can review/edit that same file with `mars-label`: launch it,
+then **File → Set Labels Folder...** and point it at
+`configs/predictions/<model_stem>/`, then reopen the image. (You're actually already
+in a fully editable labeling window right after `mars-inference` opens — this is only
+useful for coming back to a saved prediction set in a later session.)
+
+### Class mapping
+
+The model's output channels are mapped to `classes.yaml` class ids via each class's
+`id` (default) or an explicit `model_index:` field, when the model's channel order
+doesn't match your class ids 1:1. See the comment in `configs/classes.yaml`.
+
+### Model code (AI4ExoMars)
+
+`mars-inference` reconstructs the model architecture from the checkpoint itself (it
+expects the `{"model_state", "config": {"model": {...}}}` format written by
+`AI4ExoMars/vision_backend/train_stage3_segmentation_finetune.py`) using the
+`vision_backend` package from [AI4ExoMars](../AI4ExoMars). It looks for that package
+already installed, then for a sibling `../AI4ExoMars` checkout; point it elsewhere
+with `--ai4exomars-path` or `configs/app.yaml`'s `inference.ai4exomars_path`.
+
+Imagery must be 8-bit (uint8, 0 = nodata) — the same convention AI4ExoMars trains on.
+
+### Configuration
+
+```yaml
+inference:
+  ai4exomars_path: null   # null -> auto-detect ../AI4ExoMars
+  device: auto             # auto | cpu | cuda | mps
+  batch_size: 4
+  context_multiplier: 4    # context-branch models only: context crop = this * local window
+```
+
+## Analysis Layers (predictions mode)
+
+Two extra ways to look at a model, beyond its class predictions. Both build on
+analysis code in `AI4ExoMars/vision_backend` (`uncertainty/` and `pc_align/`).
+
+### Uncertainty Heatmap
+
+The **🌡 Uncertainty Heatmap** button (right panel, predictions mode only) swaps
+the class-color overlay for a per-block heatmap (blue = confident, red =
+uncertain) of *epistemic* uncertainty — Mahalanobis distance from the model's
+feature representation to the nearest class's fitted Gaussian, a standard
+out-of-distribution (OOD) detector. This needs a calibration artifact fitted
+offline from a trained checkpoint (`AI4ExoMars/vision_backend/uncertainty/fit_gaussians.py`),
+conventionally saved as `<checkpoint_stem>.uncertainty.pt` next to the checkpoint.
+Until that exists for a given model, the button reports so clearly (with the
+command to fit it) instead of guessing.
+
+Separately, every `mars-inference` run also computes per-block **softmax
+confidence** (`1 - max_softmax`) — no calibration needed, available for any
+model — feeding the Summary window's confidence stat even before an uncertainty
+artifact exists.
+
+### Class Summary
+
+The Legend panel's **📊 Summary** button opens a per-class window with, for
+every configured class:
+
+- **Neural PCA gallery** — the top-activating image crops along each of the
+  class's leading orthogonal feature directions ("what did the model learn
+  about this class"). Loaded from `<checkpoint_stem>.npca.pt`, fitted offline by
+  `AI4ExoMars/vision_backend/pc_align/fit_neural_pca.py`; shown as a clearly
+  labeled placeholder until that artifact exists.
+- **Coverage** — % of this observation's blocks currently classified as this
+  class. Always real: pure label-store arithmetic, works in plain `mars-label`
+  sessions too (no model needed).
+- **Avg. softmax confidence** / **Avg. epistemic uncertainty** — mean per-block
+  scores from the last inference / uncertainty-heatmap run in this window.
+  "N/A" until that's been run at least once.
 
 ## Labeling Workflow
 

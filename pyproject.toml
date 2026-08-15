@@ -28,8 +28,13 @@ gui = [
     "PySide6>=6.0",
 ]
 
+infer = [
+    "torch>=2.4",
+]
+
 [project.scripts]
 mars-label = "marslabeler.app:main"
+mars-inference = "marslabeler.inference_app:main"
 
 [tool.black]
 line-length = 100

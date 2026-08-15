@@ -1,6 +1,7 @@
 paths:
   classes_file: classes.yaml
   labels_dir: ./labels
+  predictions_dir: ./predictions  # mars-inference caches model predictions here (per model_id subfolder)
 
 geometry:
   panel_size: 4096
@@ -27,3 +28,10 @@ export:
   full_res: false
 
 labeler: null  # null -> OS username
+
+# mars-inference only (ignored by mars-label)
+inference:
+  ai4exomars_path: null  # null -> auto-detect sibling ../AI4ExoMars checkout, or installed package
+  device: auto            # auto | cpu | cuda | mps
+  batch_size: 4
+  context_multiplier: 4   # context crop size = context_multiplier * local window size (context-branch models only)

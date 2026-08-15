@@ -1,5 +1,7 @@
 """Legend panel: class definitions with colors and hotkeys."""
 
+from typing import Callable, Optional
+
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPixmap, QIcon
 from PySide6.QtWidgets import (
@@ -9,6 +11,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QGridLayout,
     QFrame,
+    QPushButton,
 )
 
 from marslabeler.classes import ClassScheme
@@ -21,6 +24,10 @@ class LegendPanel(QWidget):
         super().__init__(parent)
         self.classes_scheme = classes_scheme
         self.setMaximumWidth(250)
+
+        # Set by MainWindow after construction; opens the per-class Summary window
+        # (coverage + confidence/uncertainty stats + neural-PCA gallery).
+        self.on_summary_clicked: Optional[Callable[[], None]] = None
 
         layout = QVBoxLayout()
         self.setLayout(layout)
@@ -53,6 +60,15 @@ class LegendPanel(QWidget):
         list_layout.addStretch()
         scroll.setWidget(list_widget)
         layout.addWidget(scroll)
+
+        # Bottom-right corner: opens the per-class Summary window
+        self.summary_button = QPushButton("\U0001F4CA Summary")
+        self.summary_button.clicked.connect(self._on_summary_clicked)
+        layout.addWidget(self.summary_button)
+
+    def _on_summary_clicked(self) -> None:
+        if self.on_summary_clicked:
+            self.on_summary_clicked()
 
     def _create_class_item(self, class_obj) -> QWidget:
         """Create a visual item for a class."""
