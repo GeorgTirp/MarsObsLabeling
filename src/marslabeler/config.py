@@ -77,6 +77,12 @@ class InferenceConfig:
     batch_size: int = 4
     # Context crop size (context-branch models only) = context_multiplier * local window size.
     context_multiplier: int = 4
+    # Blocks with more than this fraction nodata (reusing the same preprocessing pass
+    # mars-label's skip.nodata_skip_threshold uses) are never sent through the model --
+    # retired as nodata instead. Independent of skip.nodata_skip_threshold: a
+    # majority-nodata block is still meaningfully labelable by a human, but a model
+    # prediction on one is closer to noise, so this defaults stricter.
+    nodata_skip_threshold: float = 0.33
 
 
 @dataclass

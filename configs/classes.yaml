@@ -10,21 +10,33 @@
 # Its ids there are 1-based (1..14); seg_dataset.py remaps labels 1..C -> 0..C-1
 # for training, so id here = classes_DC.json id - 1 = the model's 0-based
 # channel index, and no explicit model_index override is needed.
+#
+# Colors are NOT the NOAH-H legend's own hues (those repeat the same hue in 2-3
+# lightness steps per texture family -- fine for a static printed legend, but
+# adjacent steps of the same hue read as near-identical in this tool's overlay).
+# Generated instead as 14 colors in OKLCH, chosen (not eyeballed) so each
+# consecutive pair in this list clears the accessibility floors against this
+# app's actual dark canvas: worst adjacent CVD-simulated separation (protan/
+# deutan) 13.4 (target >=8, OKLab dE*100), worst adjacent normal-vision
+# separation 16.1 (floor >=15). One color (Textured bedrock) sits under 3:1
+# contrast on the dark surface -- acceptable per the same method's contrast
+# rule because identity here is never color-alone: the legend always shows
+# the class name in text next to its swatch.
 classes:
-  - { id: 0,  name: "Smooth + Featureless",                              color: "#00ff00", hotkey: "q" }
-  - { id: 1,  name: "Smooth + Lineated",                                 color: "#00aa00", hotkey: "w" }
-  - { id: 2,  name: "Textured non-bedrock",                              color: "#005a00", hotkey: "e" }
-  - { id: 3,  name: "Smooth bedrock",                                    color: "#ff0000", hotkey: "r" }
-  - { id: 4,  name: "Textured bedrock",                                  color: "#aa0000", hotkey: "t" }
-  - { id: 5,  name: "Rugged bedrock",                                    color: "#ffff00", hotkey: "y" }
-  - { id: 6,  name: "Fractured bedrock",                                 color: "#87005a", hotkey: "u" }
-  - { id: 7,  name: "Continuous + Simple form large ripples",            color: "#0000ff", hotkey: "i" }
-  - { id: 8,  name: "Isolated + Simple form large ripples",              color: "#ff9600", hotkey: "o" }
-  - { id: 9,  name: "Rectilinear form large ripples",                    color: "#cdcdcd", hotkey: "p" }
-  - { id: 10, name: "Continuous small ripples",                          color: "#00ffff", hotkey: "a" }
-  - { id: 11, name: "Bedrock substrate + Non-continuous small ripples",  color: "#5a0000", hotkey: "s" }
-  - { id: 12, name: "Non-bedrock substrate + Non-continuous small ripples", color: "#007dff", hotkey: "d" }
-  - { id: 13, name: "Boulder fields",                                    color: "#000000", hotkey: "f" }
+  - { id: 0,  name: "Smooth + Featureless",                                 color: "#d25cb2", hotkey: "q" }
+  - { id: 1,  name: "Smooth + Lineated",                                    color: "#007a3d", hotkey: "w" }
+  - { id: 2,  name: "Textured non-bedrock",                                 color: "#0087c2", hotkey: "e" }
+  - { id: 3,  name: "Smooth bedrock",                                       color: "#e55d4f", hotkey: "r" }
+  - { id: 4,  name: "Textured bedrock",                                     color: "#ab2b53", hotkey: "t" }
+  - { id: 5,  name: "Rugged bedrock",                                       color: "#4e71d7", hotkey: "y" }
+  - { id: 6,  name: "Fractured bedrock",                                    color: "#00a9a7", hotkey: "u" }
+  - { id: 7,  name: "Continuous + Simple form large ripples",               color: "#0074aa", hotkey: "i" }
+  - { id: 8,  name: "Isolated + Simple form large ripples",                 color: "#239036", hotkey: "o" }
+  - { id: 9,  name: "Rectilinear form large ripples",                       color: "#b769d5", hotkey: "p" }
+  - { id: 10, name: "Continuous small ripples",                             color: "#8b7b00", hotkey: "a" }
+  - { id: 11, name: "Bedrock substrate + Non-continuous small ripples",     color: "#0066c2", hotkey: "s" }
+  - { id: 12, name: "Non-bedrock substrate + Non-continuous small ripples", color: "#536f00", hotkey: "d" }
+  - { id: 13, name: "Boulder fields",                                      color: "#a29200", hotkey: "f" }
 
 # Reserved, not user-assignable via class hotkeys:
 abstain:

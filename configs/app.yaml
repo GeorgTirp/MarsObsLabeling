@@ -35,3 +35,4 @@ inference:
   device: auto            # auto | cpu | cuda | mps
   batch_size: 4
   context_multiplier: 4   # context crop size = context_multiplier * local window size (context-branch models only)
+  nodata_skip_threshold: 0.33  # blocks more nodata than this never reach the model; retired as nodata instead

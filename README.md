@@ -115,7 +115,42 @@ expects the `{"model_state", "config": {"model": {...}}}` format written by
 already installed, then for a sibling `../AI4ExoMars` checkout; point it elsewhere
 with `--ai4exomars-path` or `configs/app.yaml`'s `inference.ai4exomars_path`.
 
-Imagery must be 8-bit (uint8, 0 = nodata) — the same convention AI4ExoMars trains on.
+AI4ExoMars trains on 8-bit (uint8, 0 = nodata) imagery. Non-uint8 rasters (e.g.
+16-bit HiRISE RDR) are handled too — see [Non-8-bit imagery](#non-8-bit-imagery)
+below — but that's an approximation; uint8 input matching the training
+convention is preferred when you have it.
+
+### Performance: convert JP2s before inference
+
+Raw JP2 windowed reads at native resolution are slow — roughly 100–250x slower
+per block than a tiled GeoTIFF of the same data (measured: ~0.7s vs ~0.003s per
+512×512 read). Since each block read happens on the CPU between GPU batches,
+this is the #1 cause of `mars-inference` looking like "the GPU isn't being
+used" — the GPU is just idle, waiting on JP2 decode. (Check with `nvidia-smi`:
+low GPU utilization + high CPU + several GB allocated on the GPU means the model
+*is* loaded and running on it — the bottleneck is upstream.)
+
+Fix: convert once before running inference (a few minutes for a full HiRISE
+scene; every read after that is ~250x faster, for both `mars-inference` and
+`mars-label`):
+```bash
+python3 scripts/convert_for_inference.py /path/to/observation.JP2
+# writes /path/to/observation.tif (tiled, block_size=512, deflate-compressed)
+mars-inference /path/to/observation.tif model.pt
+```
+This mirrors what AI4ExoMars's own training pipeline does — it never reads JP2
+directly either (`noahh_alignment/warp_drg.py` produces a tiled GeoTIFF up front
+for exactly this reason).
+
+### Non-8-bit imagery
+
+Non-uint8 rasters get a *global* percentile stretch to 8-bit, computed once from
+the whole image (never per-block — that would flatten real brightness
+differences between blocks) before being fed to the model. This is a
+best-effort approximation, not a reproduction of AI4ExoMars's DRG (Digital
+Rectified Graphic) training-imagery pipeline, which involves cartographic
+processing there's no exact recipe to replicate from raw calibrated data. Status
+bar reports when it kicks in.
 
 ### Configuration
 
@@ -125,6 +160,7 @@ inference:
   device: auto             # auto | cpu | cuda | mps
   batch_size: 4
   context_multiplier: 4    # context-branch models only: context crop = this * local window
+  nodata_skip_threshold: 0.33  # blocks more nodata than this never reach the model
 ```
 
 ## Analysis Layers (predictions mode)

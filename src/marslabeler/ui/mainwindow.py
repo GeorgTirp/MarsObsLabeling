@@ -1,6 +1,7 @@
 """Main window: ties together all UI components."""
 
 import traceback
+from collections import Counter
 from pathlib import Path
 from typing import Optional
 
@@ -514,9 +515,37 @@ class MainWindow(QMainWindow):
 
         self._run_prediction(model_path, model_sig)
 
+    def _retire_high_nodata_blocks(self) -> int:
+        """Mark blocks above inference.nodata_skip_threshold nodata as nodata.
+
+        Uses the per-block nodata_fraction already computed by the preprocessing
+        pass (self.skip_decisions) -- no extra raster reads. Distinct from
+        skip.nodata_skip_threshold (mars-label's "don't bother a human with this
+        block" cutoff): a majority-nodata block is still meaningfully labelable
+        by a human, but a model prediction on one is closer to noise, so this
+        defaults stricter and is checked separately right before inference.
+        """
+        threshold = self.config.inference.nodata_skip_threshold
+        ids = [
+            b.block_id
+            for b in self.session.grid.iter_blocks()
+            if self.session.labels.get_record(b.block_id).status != "nodata"
+            and self.skip_decisions.get(b.block_id, {}).get("nodata_fraction", 0.0) > threshold
+        ]
+        if ids:
+            self.session.labels.set_nodata_bulk(ids)
+        return len(ids)
+
     def _run_prediction(self, model_path: Path, model_sig: str) -> None:
         """Run the model over every non-nodata block and seed the results as labels."""
         from marslabeler.ui.predictdialog import PredictDialog
+
+        retired = self._retire_high_nodata_blocks()
+        if retired:
+            self.status_label.setText(
+                f"Skipping {retired} blocks >{self.config.inference.nodata_skip_threshold:.0%} "
+                "nodata (off-swath) -- running inference on the rest..."
+            )
 
         blocks = [
             b
@@ -619,6 +648,10 @@ class MainWindow(QMainWindow):
     def _compute_uncertainty_layer(self) -> None:
         """Run the Mahalanobis uncertainty scorer over every non-nodata block."""
         from marslabeler.ui.uncertaintydialog import UncertaintyDialog
+
+        # Idempotent: a no-op if _run_prediction already retired these blocks (the
+        # normal case); catches the cache-hit path, where it never ran.
+        self._retire_high_nodata_blocks()
 
         blocks = [
             b
@@ -1109,7 +1142,16 @@ class MainWindow(QMainWindow):
         # overview is the maximum zoom-out
 
     def _render_overview(self) -> None:
-        """Whole-image overview: panels as cells, current highlighted, done tinted green."""
+        """Whole-image overview: panels as cells, current panel highlighted.
+
+        Labeling mode: panels tinted green once fully labeled -- a progress
+        indicator, meaningful because panels start empty and fill in over a
+        session. Predictions mode has no such progress (every panel is fully
+        predicted the instant inference finishes, so a "done" tint would just
+        paint the whole overview one color) -- it shows each panel's majority
+        class instead (or mean uncertainty, matching whichever the single-panel
+        view is currently showing).
+        """
         grid = self.session.grid
         pa, pd = grid.panels_across, grid.panels_down
         cell = 200
@@ -1124,17 +1166,51 @@ class MainWindow(QMainWindow):
         self.canvas.set_panel_image(img, stretch_percentiles=(1, 99))
         self.canvas.set_grid(pa, pd)
 
-        cell_data = np.full((pd, pa), -3, dtype=np.int16)
-        for p in range(grid.num_panels):
-            pr, pc = divmod(p, pa)
-            if self._panel_complete(p):
-                cell_data[pr, pc] = self.DONE_PANEL_TINT
-        self.canvas.set_label_overlay(cell_data, {self.DONE_PANEL_TINT: "#4CAF50"})
+        if self.predictions_mode:
+            self._render_overview_predictions(pa, pd)
+        else:
+            cell_data = np.full((pd, pa), -3, dtype=np.int16)
+            for p in range(grid.num_panels):
+                pr, pc = divmod(p, pa)
+                if self._panel_complete(p):
+                    cell_data[pr, pc] = self.DONE_PANEL_TINT
+            self.canvas.set_label_overlay(cell_data, {self.DONE_PANEL_TINT: "#4CAF50"})
 
         cur_pr, cur_pc = divmod(self.current_panel_idx, pa)
         self.canvas.set_current_block_highlight(cur_pr, cur_pc)
         self.canvas.apply_zoom_view()
         self.status_label.setText("Overview — click a panel to open it, O or Esc to go back")
+
+    def _render_overview_predictions(self, panels_across: int, panels_down: int) -> None:
+        """Predictions-mode overview overlay: per-panel majority class, or per-panel
+        mean uncertainty when the Uncertainty Heatmap layer is toggled on."""
+        grid = self.session.grid
+
+        if self.display_layer == "uncertainty":
+            values = np.full((panels_down, panels_across), np.nan, dtype=np.float32)
+            for p in range(grid.num_panels):
+                pr, pc = divmod(p, panels_across)
+                scores = [
+                    self.block_uncertainty[b.block_id]
+                    for b in grid.get_panel_blocks(p)
+                    if b.block_id in self.block_uncertainty
+                ]
+                if scores:
+                    values[pr, pc] = sum(scores) / len(scores)
+            self.canvas.set_scalar_overlay(values)
+            return
+
+        cell_data = np.full((panels_down, panels_across), -3, dtype=np.int16)
+        for p in range(grid.num_panels):
+            pr, pc = divmod(p, panels_across)
+            class_ids = [
+                self.session.labels.get_record(b.block_id).class_id
+                for b in grid.get_panel_blocks(p)
+                if self.session.labels.get_record(b.block_id).status not in ("unlabeled", "nodata")
+            ]
+            if class_ids:
+                cell_data[pr, pc] = Counter(class_ids).most_common(1)[0][0]
+        self.canvas.set_label_overlay(cell_data, self._class_colors())
 
     def _render_multi(self, span: int) -> None:
         """Zoom-out showing span×span panels around the current one (black-padded)."""
