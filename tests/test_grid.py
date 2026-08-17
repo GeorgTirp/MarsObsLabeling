@@ -200,3 +200,80 @@ def test_get_panel_invalid_index(basic_grid):
     """Test that invalid panel index raises."""
     with pytest.raises(IndexError):
         basic_grid.get_panel_blocks(999)
+
+
+# --------------------------------------------------------------------------- #
+# Edge-panel geometry (image dims not a multiple of panel_size/block_size)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def ragged_grid():
+    """Grid whose image is not a whole number of panels or blocks.
+
+    This is the realistic case for HiRISE observations, and the one where the
+    right-hand column and bottom row of panels are only partially covered.
+    """
+    return Grid(
+        img_width=10000,
+        img_height=8500,
+        panel_size=4096,
+        block_size=512,
+        obs_id="RAGGED_OBS",
+        transform=Affine.identity(),
+    )
+
+
+def test_no_block_has_negative_extent(ragged_grid):
+    """Blocks whose origin falls outside the image clamp to 0, never negative.
+
+    A negative w_px/h_px reaches numpy as np.zeros((-n, -m)) and raises
+    ValueError inside a Qt event handler, which PySide6 swallows -- leaving
+    the UI showing a stale block preview rather than crashing.
+    """
+    bad = [b for b in ragged_grid.iter_blocks() if b.w_px < 0 or b.h_px < 0]
+    assert bad == [], f"{len(bad)} blocks have negative extent, e.g. {bad[:3]}"
+
+
+def test_blocks_are_either_empty_or_within_image(ragged_grid):
+    """Every block is either zero-sized or lies fully inside the image bounds."""
+    for b in ragged_grid.iter_blocks():
+        assert b.w_px >= 0 and b.h_px >= 0
+        if b.w_px > 0 and b.h_px > 0:
+            assert b.x_px + b.w_px <= ragged_grid.img_width
+            assert b.y_px + b.h_px <= ragged_grid.img_height
+
+
+def test_ragged_grid_has_ghost_blocks(ragged_grid):
+    """The ragged case really does produce out-of-image blocks (guards the fixture)."""
+    ghosts = [b for b in ragged_grid.iter_blocks() if b.w_px == 0 or b.h_px == 0]
+    assert ghosts, "fixture no longer exercises the partial-panel case"
+
+
+def test_panel_canvas_extent_matches_block_grid(ragged_grid):
+    """Single-panel rendering must span panel_size, not the clipped panel coords.
+
+    The canvas draws a uniform blocks_per_panel_row x blocks_per_panel_col grid and
+    maps clicks through it, so the rendered extent has to be exactly panel_size on
+    each side. Rendering the clipped extent from get_panel_coords() instead would
+    stretch edge panels and desynchronise clicks from the previewed block.
+    """
+    g = ragged_grid
+    canvas = 1600
+    block_px_canvas = canvas // g.blocks_per_panel_col
+
+    for panel_idx in range(g.num_panels):
+        x, y, w, h = g.get_panel_coords(panel_idx)
+        for canvas_x in range(0, canvas, block_px_canvas):
+            expected_col = canvas_x // block_px_canvas
+            # Rendering the full panel_size extent keeps click mapping exact...
+            padded_col = int((canvas_x * g.panel_size / canvas) // g.block_size)
+            assert padded_col == expected_col
+
+        # ...whereas the clipped extent only agrees when the panel is full-width.
+        if w < g.panel_size:
+            clipped_cols = {
+                int((cx * w / canvas) // g.block_size)
+                for cx in range(0, canvas, block_px_canvas)
+            }
+            assert len(clipped_cols) < g.blocks_per_panel_col

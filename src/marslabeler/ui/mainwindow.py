@@ -730,11 +730,20 @@ class MainWindow(QMainWindow):
         self._clear_selection()
         self.status_label.setText(f"Loading panel {self.current_panel_idx}...")
 
-        # Synchronous decimated read at the current zoom resolution (fast via GDAL)
+        # Synchronous decimated read at the current zoom resolution (fast via GDAL).
+        # Read the FULL panel_size extent (black-padded past the image edge), not the
+        # clipped w/h from get_panel_coords: the grid overlay and click mapping both
+        # assume the canvas spans exactly panel_size x panel_size. Feeding a clipped
+        # edge panel here would stretch it to fill the square canvas, so block
+        # boundaries would no longer land on the drawn grid lines -- the border
+        # panels' clicks would select a different block than the one previewed.
+        # This matches what _render_overview / _render_multi already do.
         grid = self.session.grid
-        x, y, w, h = grid.get_panel_coords(self.current_panel_idx)
+        x, y, _w, _h = grid.get_panel_coords(self.current_panel_idx)
         out = self.canvas.canvas_width  # 1600 at zoom 1, larger when zoomed in
-        panel_data = self.session.raster.read_window(x, y, w, h, out, out)
+        panel_data = self.session.raster.read_window_padded(
+            x, y, grid.panel_size, grid.panel_size, out, out
+        )
         self._render_panel(panel_data)
 
     def _render_panel(self, panel_data: np.ndarray):
