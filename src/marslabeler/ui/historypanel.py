@@ -28,6 +28,7 @@ class HistoryPanel(QWidget):
         self.label_store = label_store
         self.hidden_panels = set(hidden_panels or ())  # fully empty panels to omit
         self.on_panel_selected: Optional[Callable[[int], None]] = None
+        self.current_panel_idx: Optional[int] = None  # panel open in the canvas right now
 
         # Stored references so we can refresh in place (no rebuild on every label)
         self.panel_frames: dict[int, QFrame] = {}
@@ -122,10 +123,11 @@ class HistoryPanel(QWidget):
         return frame
 
     def _apply_item_state(self, panel_idx: int) -> None:
-        """Update progress value, label text, and done styling for one panel."""
+        """Update progress value, label text, and done/current styling for one panel."""
         total_blocks = self.grid.blocks_per_panel
         labeled = self._labeled_count(panel_idx)
         complete = self._is_complete(panel_idx)
+        is_current = panel_idx == self.current_panel_idx
 
         bar = self.panel_bars[panel_idx]
         bar.setMaximum(total_blocks)
@@ -135,23 +137,50 @@ class HistoryPanel(QWidget):
         panel_row, panel_col = divmod(panel_idx, self.grid.panels_across)
         label = self.panel_labels[panel_idx]
         frame = self.panel_frames[panel_idx]
+        name = f"Panel ({panel_row}, {panel_col})"
 
         if complete:
-            label.setText(f"✓ Panel ({panel_row}, {panel_col})")
+            label.setText(f"✓ {name}")
             label.setStyleSheet("font-weight: bold; color: #7ED957;")
-            frame.setStyleSheet(
-                "QFrame { background-color: #1f3d1f; border: 1px solid #4CAF50; "
-                "border-radius: 2px; padding: 4px; }"
-            )
-            frame.setToolTip("Done and saved")
         else:
-            label.setText(f"Panel ({panel_row}, {panel_col})")
+            label.setText(name)
             label.setStyleSheet("font-weight: bold;")
-            frame.setStyleSheet(
-                "QFrame { background-color: #2a2a2a; border: 1px solid #444; "
-                "border-radius: 2px; padding: 4px; }"
-            )
+
+        if is_current:
+            # Border color always wins over the done/not-done fill so the active
+            # panel stays findable in the list regardless of its completion state.
+            border = "3px solid #FFEB3B"
+            bg = "#1f3d1f" if complete else "#3d3a1f"
+        elif complete:
+            border = "1px solid #4CAF50"
+            bg = "#1f3d1f"
+        else:
+            border = "1px solid #444"
+            bg = "#2a2a2a"
+        frame.setStyleSheet(
+            f"QFrame {{ background-color: {bg}; border: {border}; "
+            "border-radius: 2px; padding: 4px; }"
+        )
+
+        if is_current and complete:
+            frame.setToolTip("Currently viewing (done and saved)")
+        elif complete:
+            frame.setToolTip("Done and saved")
+        elif is_current:
+            frame.setToolTip("Currently viewing")
+        else:
             frame.setToolTip("")
+
+    def set_current_panel(self, panel_idx: Optional[int]) -> None:
+        """Mark panel_idx as the one open in the canvas right now (yellow border)."""
+        if panel_idx == self.current_panel_idx:
+            return
+        previous = self.current_panel_idx
+        self.current_panel_idx = panel_idx
+        if previous is not None and previous in self.panel_frames:
+            self._apply_item_state(previous)
+        if panel_idx is not None and panel_idx in self.panel_frames:
+            self._apply_item_state(panel_idx)
 
     def refresh(self) -> None:
         """Recompute progress and done state for all panels (in place)."""

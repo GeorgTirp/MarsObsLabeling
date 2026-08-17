@@ -705,6 +705,7 @@ class MainWindow(QMainWindow):
         )
         history.on_panel_selected = self._on_panel_selected
         history.setMaximumWidth(200)
+        history.set_current_panel(self.current_panel_idx)
         old_item = self.main_layout.replaceWidget(self.history_panel, history)
         if old_item is not None and old_item.widget() is not None:
             old_item.widget().deleteLater()
@@ -1455,8 +1456,9 @@ class MainWindow(QMainWindow):
         return p if p < n else None
 
     def _refresh_history(self) -> None:
-        """Refresh the history panel's progress bars and done markers in place."""
+        """Refresh the history panel's progress bars, done markers, and current-panel highlight."""
         if isinstance(self.history_panel, HistoryPanel):
+            self.history_panel.set_current_panel(self.current_panel_idx)
             self.history_panel.refresh()
 
     def _export(self) -> None:

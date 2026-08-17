@@ -4,7 +4,7 @@ from typing import Optional, Callable
 
 import numpy as np
 from PySide6.QtCore import Qt, QSize, QRectF
-from PySide6.QtGui import QPixmap, QImage, QColor, QPen, QBrush
+from PySide6.QtGui import QPainter, QPixmap, QImage, QColor, QPen, QBrush
 from PySide6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsRectItem
 
 from marslabeler.ui.render import (
@@ -25,6 +25,12 @@ class PanelCanvas(QGraphicsView):
         self.scene = QGraphicsScene()
         self.setScene(self.scene)
         self.setBackgroundBrush(Qt.GlobalColor.black)
+        # Overlays are pre-rasterized to fixed-size pixmaps, then scaled by the view's
+        # zoom transform. Without SmoothPixmapTransform, Qt's default nearest-neighbor
+        # scaling can drop thin (1px) grid lines entirely at certain non-integer scale
+        # ratios -- the exact ratio depends on the viewport's pixel size, which varies
+        # by window/monitor, so this bit differently per machine.
+        self.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
 
         # Layer management
         self.image_item: Optional[QGraphicsPixmapItem] = None
@@ -97,13 +103,13 @@ class PanelCanvas(QGraphicsView):
         self.block_width = self.canvas_width // blocks_per_row
         self.block_height = self.canvas_height // blocks_per_col
 
-        # Create and set grid overlay
+        # Create and set grid overlay (2px: stays visible under view-scale downsampling)
         grid_pixmap = create_grid_overlay(
             self.canvas_width,
             self.canvas_height,
             self.block_width,
             QColor(0, 255, 0),
-            line_width=1,
+            line_width=2,
         )
 
         if self.grid_item is None:

@@ -23,7 +23,7 @@ class LegendPanel(QWidget):
     def __init__(self, classes_scheme: ClassScheme, parent=None):
         super().__init__(parent)
         self.classes_scheme = classes_scheme
-        self.setMaximumWidth(250)
+        self.setMaximumWidth(520)  # matches SidePreview's column width above it
 
         # Set by MainWindow after construction; opens the per-class Summary window
         # (coverage + confidence/uncertainty stats + neural-PCA gallery).
