@@ -81,9 +81,13 @@ class Grid:
                     block_x = panel_x_start + local_block_col * self.block_size
                     block_y = panel_y_start + local_block_row * self.block_size
 
-                    # Handle partial blocks at edges
-                    block_w = min(self.block_size, self.img_width - block_x)
-                    block_h = min(self.block_size, self.img_height - block_y)
+                    # Handle partial blocks at edges. The last panel row/col is only
+                    # partially covered by real image data (img dims are essentially
+                    # never exact multiples of panel_size), so a block's own origin
+                    # can fall beyond the image entirely -- clamp to 0 rather than
+                    # letting w_px/h_px go negative (crashes any windowed read).
+                    block_w = max(0, min(self.block_size, self.img_width - block_x))
+                    block_h = max(0, min(self.block_size, self.img_height - block_y))
 
                     block_id = f"{self.obs_id}_{block_x}_{block_y}"
                     info = BlockInfo(
