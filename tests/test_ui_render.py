@@ -11,7 +11,9 @@ from marslabeler.ui.render import (
     create_block_overlay,
     create_heatmap_overlay,
     create_current_block_highlight,
+    create_pixel_class_overlay,
     value_to_heatmap_color,
+    _nearest_neighbor_resize,
 )
 
 
@@ -113,3 +115,70 @@ def test_create_current_block_highlight():
 
     assert pixmap.width() == 400
     assert pixmap.height() == 400
+
+
+# --------------------------------------------------------------------------
+# _nearest_neighbor_resize / create_pixel_class_overlay (pixel-wise predictions)
+# --------------------------------------------------------------------------
+def test_nearest_neighbor_resize_no_op_when_size_matches():
+    data = np.array([[1, 2], [3, 4]], dtype=np.int16)
+    assert np.array_equal(_nearest_neighbor_resize(data, 2, 2), data)
+
+
+def test_nearest_neighbor_resize_downsamples_without_blending():
+    """Never interpolate class ids -- every output cell must come from exactly
+    one input cell's value, never an average of several."""
+    data = np.array([[1, 1, 2, 2], [1, 1, 2, 2], [3, 3, 4, 4], [3, 3, 4, 4]], dtype=np.int16)
+    resized = _nearest_neighbor_resize(data, 2, 2)
+    assert set(np.unique(resized)).issubset({1, 2, 3, 4})
+    assert resized.shape == (2, 2)
+
+
+def test_nearest_neighbor_resize_upsamples():
+    data = np.array([[7]], dtype=np.int16)
+    resized = _nearest_neighbor_resize(data, 4, 4)
+    assert resized.shape == (4, 4)
+    assert np.all(resized == 7)
+
+
+def test_create_pixel_class_overlay_shape_matches_requested_canvas_size():
+    class_ids = np.array([[0, 1], [1, 2]], dtype=np.int16)
+    pixmap = create_pixel_class_overlay(class_ids, {0: "#FF0000", 1: "#00FF00", 2: "#0000FF"}, 400, 300)
+    assert pixmap.width() == 400
+    assert pixmap.height() == 300
+
+
+def test_create_pixel_class_overlay_colors_match_class_colors():
+    class_ids = np.array([[0, 1], [2, 0]], dtype=np.int16)
+    colors = {0: "#ff0000", 1: "#00ff00", 2: "#0000ff"}
+    pixmap = create_pixel_class_overlay(class_ids, colors, 2, 2, alpha=1.0)
+    image = pixmap.toImage()
+
+    assert image.pixelColor(0, 0) == QColor(255, 0, 0)
+    assert image.pixelColor(1, 0) == QColor(0, 255, 0)
+    assert image.pixelColor(0, 1) == QColor(0, 0, 255)
+    assert image.pixelColor(1, 1) == QColor(255, 0, 0)
+
+
+def test_create_pixel_class_overlay_unmapped_and_sentinel_ids_are_transparent():
+    class_ids = np.array([[-1, 99]], dtype=np.int16)  # -1 = no prediction, 99 = unknown class
+    pixmap = create_pixel_class_overlay(class_ids, {0: "#ff0000"}, 2, 1, alpha=1.0)
+    image = pixmap.toImage()
+
+    assert image.pixelColor(0, 0).alpha() == 0
+    assert image.pixelColor(1, 0).alpha() == 0
+
+
+def test_create_pixel_class_overlay_alpha_applied():
+    class_ids = np.array([[0]], dtype=np.int16)
+    pixmap = create_pixel_class_overlay(class_ids, {0: "#ff0000"}, 1, 1, alpha=0.5)
+    image = pixmap.toImage()
+    assert image.pixelColor(0, 0).alpha() == 128  # round(255 * 0.5)
+
+
+def test_create_pixel_class_overlay_empty_class_colors_all_transparent():
+    class_ids = np.array([[0, 1]], dtype=np.int16)
+    pixmap = create_pixel_class_overlay(class_ids, {}, 2, 1)
+    image = pixmap.toImage()
+    assert image.pixelColor(0, 0).alpha() == 0
+    assert image.pixelColor(1, 0).alpha() == 0

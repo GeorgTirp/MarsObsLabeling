@@ -93,6 +93,34 @@ def test_get_block_row_major_order(basic_grid):
     assert block8.y_px == 512
 
 
+def test_block_index_at_pixel_matches_get_block_by_index(basic_grid):
+    """Direct arithmetic inverse of _build_block_index -- every real block's
+    own top-left pixel must map back to that exact block index."""
+    for idx in (0, 1, 8, 63):
+        block = basic_grid.get_block(idx)
+        assert basic_grid.block_index_at_pixel(block.x_px, block.y_px) == idx
+
+
+def test_block_index_at_pixel_anywhere_within_a_block_resolves_to_it(basic_grid):
+    block = basic_grid.get_block(0)  # x_px=0, y_px=0, 512x512
+    idx = basic_grid.block_index_at_pixel(block.x_px + 300, block.y_px + 100)
+    assert idx == 0
+
+
+def test_block_index_at_pixel_multi_panel(multi_panel_grid):
+    """Pixel (4096, 0) is the first column of panel 1 (top-right), not panel 0."""
+    panel0_last_block = multi_panel_grid.block_index_at_pixel(4095, 0)
+    panel1_first_block = multi_panel_grid.block_index_at_pixel(4096, 0)
+    assert multi_panel_grid.get_block(panel0_last_block).panel_idx == 0
+    assert multi_panel_grid.get_block(panel1_first_block).panel_idx == 1
+
+
+def test_block_index_at_pixel_clamps_out_of_bounds(basic_grid):
+    assert basic_grid.block_index_at_pixel(-100, -100) == basic_grid.block_index_at_pixel(0, 0)
+    last_idx = basic_grid.num_blocks() - 1
+    assert basic_grid.block_index_at_pixel(100_000, 100_000) == last_idx
+
+
 def test_get_panel_blocks(basic_grid):
     """Test getting all blocks in a panel."""
     blocks = basic_grid.get_panel_blocks(0)

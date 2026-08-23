@@ -112,6 +112,93 @@ def sidecar_path(checkpoint_path: str | Path, suffix: str) -> Path:
     return checkpoint_path.with_suffix("").with_suffix(f".{suffix}")
 
 
+def _resolve_ai4exomars_root(explicit_path: str | None = None) -> Path | None:
+    """Best-effort AI4ExoMars repo root -- for resolving paths a checkpoint's
+    own saved config stores relative to it (e.g. loader_config_path,
+    imagery_path). Distinct from _ensure_vision_backend_importable: that one
+    only needs `vision_backend` to become importable (which needs no known
+    root at all when it's already `pip install`'d into this environment), so
+    it can't be reused here directly.
+
+    Tries, in order: an explicit path, vision_backend's own install location
+    (if already importable -- works for both a regular and an editable
+    install), then the same sibling-checkout convention
+    _ensure_vision_backend_importable() falls back to. Returns None (never
+    raises) if nothing pans out.
+    """
+    candidates: list[Path] = []
+    if explicit_path:
+        candidates.append(Path(explicit_path).expanduser())
+    try:
+        import vision_backend
+
+        candidates.append(Path(vision_backend.__file__).resolve().parent.parent)
+    except ModuleNotFoundError:
+        pass
+    repo_root = Path(__file__).resolve().parents[3]
+    candidates.append(repo_root.parent / "AI4ExoMars")
+
+    for candidate in candidates:
+        if (candidate / "vision_backend").is_dir():
+            return candidate
+    return None
+
+
+def _resolve_relative_to(path_str: str, root: Path | None) -> Path:
+    path = Path(path_str).expanduser()
+    if path.is_absolute() or root is None:
+        return path
+    return root / path
+
+
+def resolve_training_imagery_path(
+    checkpoint_path: str | Path, *, ai4exomars_path: str | None = None
+) -> Path | None:
+    """Best-effort: the imagery raster this checkpoint's Stage-3 training run
+    (and, by convention, its Neural-PCA calibration pass --
+    `fit_neural_pca.py`'s own examples reuse the same `--imagery-path`) point
+    at. Lets a Neural-PCA gallery's `source_id` strings (each built from
+    `Path(imagery_path).stem` + a pixel col/row, see
+    `AI4ExoMars/vision_backend/pc_align/fit_neural_pca.py`) be traced back to
+    a real file on disk, for "jump to this gallery thumbnail's location"
+    navigation -- see npca_gallery.parse_npca_source_id.
+
+    Returns None (never raises) if anything along the chain is missing: the
+    checkpoint has no saved `config["data"]["loader_config_path"]`, that file
+    doesn't exist, or the `imagery_path` it names doesn't exist -- this is
+    best-effort provenance, not a guaranteed contract, and a checkpoint
+    trained before this convention (or moved/retrained data) is expected to
+    fail gracefully here rather than raise.
+    """
+    import json
+
+    import torch
+
+    try:
+        checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    except Exception:
+        return None
+    config = checkpoint.get("config", {}) or {}
+    loader_config_path = (config.get("data", {}) or {}).get("loader_config_path")
+    if not loader_config_path:
+        return None
+
+    root = _resolve_ai4exomars_root(ai4exomars_path)
+    loader_config_file = _resolve_relative_to(loader_config_path, root)
+    if not loader_config_file.exists():
+        return None
+    try:
+        loader_config = json.loads(loader_config_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    imagery_path = loader_config.get("imagery_path")
+    if not imagery_path:
+        return None
+    imagery_file = _resolve_relative_to(imagery_path, root)
+    return imagery_file if imagery_file.exists() else None
+
+
 def load_model_bundle(
     checkpoint_path: str | Path,
     *,

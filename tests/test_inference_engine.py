@@ -8,6 +8,7 @@ from marslabeler.inference.engine import (
     compute_global_quantization,
     quantize_to_uint8,
     run_block_inference,
+    run_block_inference_with_pixel_maps,
 )
 from marslabeler.model.grid import BlockInfo
 
@@ -154,6 +155,71 @@ def test_predict_fn_batch_size_mismatch_raises():
 
     with pytest.raises(ValueError, match="predict_fn returned"):
         run_block_inference(raster, blocks, plan, bad_predict_fn)
+
+
+# --------------------------------------------------------------------------
+# run_block_inference_with_pixel_maps (pixel-wise vs. block-wise rendering)
+# --------------------------------------------------------------------------
+def test_pixel_maps_majority_matches_run_block_inference():
+    """The majority-voted half of the return value must be identical to
+    run_block_inference's own result -- same underlying computation."""
+    blocks = [make_block(f"b{i}", i * 8, 0) for i in range(5)]
+    raster = FakeRaster(lambda x, y: (x // 8) % 5)
+    plan = InferencePlan(pad_size=8, batch_size=2)
+
+    majority, _ = run_block_inference_with_pixel_maps(raster, blocks, plan, majority_vote_predict_fn)
+    reference = run_block_inference(raster, blocks, plan, majority_vote_predict_fn)
+
+    assert majority == reference == {f"b{i}": i for i in range(5)}
+
+
+def test_pixel_maps_default_keeps_per_pixel_crops():
+    block = make_block("b0", 0, 0, w=4, h=4)
+
+    def predict_fn(local_batch, context_batch):
+        out = np.full(local_batch.shape, 9, dtype=np.int64)
+        out[:, :4, :4] = 2  # true block region (rest is padding, per pad_size=16)
+        out[:, 0, 0] = 5  # one differing pixel, so the crop isn't uniform
+        return out
+
+    plan = InferencePlan(pad_size=16, batch_size=4)
+    majority, pixel_maps = run_block_inference_with_pixel_maps(
+        FakeRaster(lambda x, y: 0), [block], plan, predict_fn
+    )
+
+    assert majority == {"b0": 2}  # 15 of 16 pixels are class 2
+    assert set(pixel_maps.keys()) == {"b0"}
+    crop = pixel_maps["b0"]
+    assert crop.shape == (4, 4)  # cropped to w_px x h_px, padding discarded
+    assert crop.dtype == np.uint8
+    assert crop[0, 0] == 5
+    assert np.all(crop.ravel()[1:] == 2)
+
+
+def test_pixel_maps_keep_false_returns_empty_dict_but_same_majority():
+    blocks = [make_block("b0", 0, 0), make_block("b1", 8, 0)]
+    raster = FakeRaster(lambda x, y: 3 if x == 0 else 7)
+    plan = InferencePlan(pad_size=8, batch_size=4)
+
+    majority, pixel_maps = run_block_inference_with_pixel_maps(
+        raster, blocks, plan, majority_vote_predict_fn, keep_pixel_maps=False
+    )
+
+    assert majority == {"b0": 3, "b1": 7}
+    assert pixel_maps == {}
+
+
+def test_run_block_inference_return_type_unchanged_by_new_function():
+    """Regression guard: run_block_inference must still return a plain dict,
+    not a tuple, even though it now delegates to the new function internally."""
+    blocks = [make_block("b0", 0, 0)]
+    raster = FakeRaster(lambda x, y: 1)
+    plan = InferencePlan(pad_size=8)
+
+    result = run_block_inference(raster, blocks, plan, majority_vote_predict_fn)
+
+    assert isinstance(result, dict)
+    assert not isinstance(result, tuple)
 
 
 class FakeWholeImageRaster:

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QHBoxLayout,
     QVBoxLayout,
+    QSplitter,
     QStatusBar,
     QLabel,
     QFileDialog,
@@ -68,6 +69,10 @@ class MainWindow(QMainWindow):
         self.predictions_mode = predictions_mode
         self.model_path: Optional[Path] = None
         self._model_sig: Optional[str] = None
+        # Kept alive + non-modal (see _show_class_summary) so a Neural-PCA
+        # thumbnail click can navigate this window while the summary stays
+        # open and visible alongside it.
+        self._summary_dialog = None
 
         # Analysis layers (mars-inference): which overlay the canvas is showing, and
         # the per-block data behind it. All empty/None until inference actually runs
@@ -77,6 +82,19 @@ class MainWindow(QMainWindow):
         self.block_confidence: dict[str, float] = {}  # block_id -> mean softmax confidence
         self.block_uncertainty: dict[str, float] = {}  # block_id -> mean epistemic (Mahalanobis) uncertainty
         self.npca_gallery: Optional[dict] = None  # class model_index -> component -> ranked thumbnails
+
+        # Which granularity the "classes" display_layer renders at: "pixelwise"
+        # (each pixel colored by its own predicted class -- the model's raw
+        # output, computed for free during inference and free to render) or
+        # "blockwise" (one solid color per block -- LabelStore's own majority-
+        # voted/edited class, today's original behavior). block_pixel_predictions
+        # holds the per-block raw crops "pixelwise" stitches together; empty
+        # until _run_prediction() runs (a cache-hit reload of previously-saved
+        # predictions never repopulates it -- only the block-level class survives
+        # a save, see _save_predictions -- so pixelwise falls back to blockwise
+        # per-panel whenever no crop is cached for it).
+        self.prediction_render_mode = "pixelwise"  # "pixelwise" | "blockwise"
+        self.block_pixel_predictions: dict[str, np.ndarray] = {}
 
         # Optional classification tile resolution override (meters/tile-side), from
         # --resolution. None -> use config.geometry.block_size unchanged.
@@ -115,12 +133,13 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self):
         """Build UI layout."""
-        central = QWidget()
-        self.setCentralWidget(central)
-
-        # Main layout: history | canvas | legend+preview
-        main_layout = QHBoxLayout()
-        central.setLayout(main_layout)
+        # Main layout: history | canvas | legend | preview+actions, as a splitter
+        # so each column can be dragged wider/narrower live. The legend gets its
+        # own full-height column (rather than being stacked under the preview)
+        # so all classes are readable at once without scrolling.
+        main_layout = QSplitter(Qt.Horizontal)
+        main_layout.setChildrenCollapsible(False)
+        self.setCentralWidget(main_layout)
         self.main_layout = main_layout
 
         # Left: History panel (placeholder until session loads)
@@ -134,19 +153,19 @@ class MainWindow(QMainWindow):
         self.canvas.on_block_paint = self._on_block_paint
         self.canvas.on_block_paint_end = self._on_block_paint_end
         self.canvas.on_selection_made = self._on_selection_made
-        main_layout.addWidget(self.canvas, 1)
+        main_layout.addWidget(self.canvas)
 
-        # Right: Preview (top) and legend (below) vertical stack
+        # Legend column (placeholder until a session loads and classes are known)
+        self.legend_panel = QLabel("(No session)")
+        main_layout.addWidget(self.legend_panel)
+
+        # Right: Preview (top) + action buttons
         right_layout = QVBoxLayout()
         self.right_layout = right_layout
 
         # Side preview (top)
         self.preview = SidePreview()
         right_layout.addWidget(self.preview)
-
-        # Legend panel (below preview, placeholder until session loads)
-        self.legend_panel = QLabel("(No session)")
-        right_layout.addWidget(self.legend_panel)
 
         right_layout.addStretch()
 
@@ -165,6 +184,19 @@ class MainWindow(QMainWindow):
         self.uncertainty_button.setVisible(self.predictions_mode)
         self.uncertainty_button.clicked.connect(self._toggle_uncertainty_layer)
         right_layout.addWidget(self.uncertainty_button)
+
+        # Only shown in predictions mode: pixel-wise (raw per-pixel model output,
+        # the default) vs. blockwise (LabelStore's solid-per-block class, same
+        # as the classic labeling view) coloring. Disabled until pixel-level
+        # crops actually exist (_run_prediction populates them; a cache-hit
+        # reload of previously-saved predictions never does, see
+        # block_pixel_predictions's docstring in __init__).
+        self.render_mode_button = QPushButton("\U0001F5FA Pixel-wise view")
+        self.render_mode_button.setEnabled(False)
+        self.render_mode_button.setCheckable(True)
+        self.render_mode_button.setVisible(self.predictions_mode)
+        self.render_mode_button.clicked.connect(self._toggle_render_mode)
+        right_layout.addWidget(self.render_mode_button)
 
         self.next_panel_button = QPushButton("Next Panel ▶  (fills rest as NA)")
         self.next_panel_button.setEnabled(False)
@@ -186,6 +218,18 @@ class MainWindow(QMainWindow):
         right_widget = QWidget()
         right_widget.setLayout(right_layout)
         main_layout.addWidget(right_widget)
+
+        # Canvas gets the extra space when the window resizes; history/legend/
+        # right columns stay put unless the user drags a handle themselves.
+        main_layout.setStretchFactor(main_layout.indexOf(self.canvas), 1)
+        main_layout.setSizes([200, 1100, 250, 320])
+        # setChildrenCollapsible(False) alone leaves isCollapsible() reporting
+        # True per pane in this Qt build (childrenCollapsible is the runtime
+        # default; isCollapsible() reflects each pane's own override, which
+        # stays at Qt's True default until set explicitly) -- set it per pane
+        # too so a stray drag can't hide the canvas or legend entirely.
+        for i in range(main_layout.count()):
+            main_layout.setCollapsible(i, False)
 
         # Status bar
         self.statusBar = QStatusBar()
@@ -269,6 +313,11 @@ class MainWindow(QMainWindow):
             self.block_uncertainty = {}
             self.uncertainty_button.setChecked(False)
             self.uncertainty_button.setEnabled(False)
+            self.prediction_render_mode = "pixelwise"
+            self.block_pixel_predictions = {}
+            self.render_mode_button.setChecked(False)
+            self.render_mode_button.setText("\U0001F5FA Pixel-wise view")
+            self.render_mode_button.setEnabled(False)
 
         try:
             # Open raster
@@ -486,6 +535,10 @@ class MainWindow(QMainWindow):
         self.block_confidence = {}
         self.block_uncertainty = {}
         self.uncertainty_button.setChecked(False)
+        self.prediction_render_mode = "pixelwise"
+        self.block_pixel_predictions = {}
+        self.render_mode_button.setChecked(False)
+        self.render_mode_button.setText("\U0001F5FA Pixel-wise view")
         self.npca_gallery = self._try_load_npca_gallery(model_path)
 
         model_sig = self._model_signature(model_path)
@@ -579,6 +632,8 @@ class MainWindow(QMainWindow):
         class_names = {cid: c.name for cid, c in self.classes_scheme.classes.items()}
         self.session.labels.seed_bulk(predictions, class_names)
         self.block_confidence = dialog.get_confidence()
+        self.block_pixel_predictions = dialog.get_pixel_predictions()
+        self.render_mode_button.setEnabled(bool(self.block_pixel_predictions))
         self._model_sig = model_sig
 
         self._refresh_view()
@@ -622,6 +677,19 @@ class MainWindow(QMainWindow):
             return None
         except Exception:
             return None
+
+    def _toggle_render_mode(self) -> None:
+        """Pixel-wise/Block-wise view button: switch how the "classes" display
+        layer renders, without touching what's stored (LabelStore keeps the
+        block-level class either way; blockwise reads it directly, pixelwise
+        renders the cached per-pixel crops instead -- see block_pixel_predictions)."""
+        if self.render_mode_button.isChecked():
+            self.prediction_render_mode = "blockwise"
+            self.render_mode_button.setText("\U0001F5FA Block-wise view")
+        else:
+            self.prediction_render_mode = "pixelwise"
+            self.render_mode_button.setText("\U0001F5FA Pixel-wise view")
+        self._refresh_label_overlay()
 
     def _toggle_uncertainty_layer(self) -> None:
         """Uncertainty Heatmap button: swap the class-color overlay for the
@@ -683,9 +751,16 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Computed uncertainty for {len(self.block_uncertainty)} blocks")
 
     def _show_class_summary(self) -> None:
-        """Legend panel's Summary button: open the per-class summary window."""
+        """Legend panel's Summary button: open (or re-focus) the per-class
+        summary window. Shown non-modally -- see _on_npca_thumbnail_clicked --
+        so it can stay open and visible while this window navigates."""
         if not self.session or not self.classes_scheme:
             return
+
+        if self._summary_dialog is not None:
+            self._summary_dialog.close()
+            self._summary_dialog.deleteLater()
+
         from marslabeler.ui.summarydialog import ClassSummaryDialog
 
         dialog = ClassSummaryDialog(
@@ -696,7 +771,78 @@ class MainWindow(QMainWindow):
             block_uncertainty=self.block_uncertainty,
             parent=self,
         )
-        dialog.exec()
+        dialog.thumbnail_clicked.connect(self._on_npca_thumbnail_clicked)
+        self._summary_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_npca_thumbnail_clicked(self, source_id: str) -> None:
+        """Neural-PCA gallery thumbnail (Class Summary window) clicked: jump
+        this window to that exact block, opening its source training mosaic
+        first (in plain view -- no fresh inference run) if a different image
+        is currently loaded. The gallery's thumbnails are top-activating crops
+        from AI4ExoMars's training run, not from whatever observation happens
+        to be open here, so this is a genuine "switch images" navigation, not
+        just scrolling the current one -- see resolve_training_imagery_path's
+        docstring for why.
+        """
+        from marslabeler.inference.npca_gallery import parse_npca_source_id
+
+        parsed = parse_npca_source_id(source_id)
+        if parsed is None:
+            QMessageBox.information(
+                self, "Can't locate this thumbnail",
+                f"Couldn't parse a pixel location out of {source_id!r}.",
+            )
+            return
+        mosaic_stem, col, row = parsed
+
+        if not self.model_path:
+            QMessageBox.information(
+                self, "Can't locate this thumbnail",
+                "No model checkpoint is loaded in this window, so its "
+                "training imagery can't be resolved.",
+            )
+            return
+
+        from marslabeler.inference.modelio import resolve_training_imagery_path
+
+        self.status_label.setText(f"Resolving source image for {source_id!r}...")
+        QApplication.processEvents()
+        imagery_path = resolve_training_imagery_path(
+            self.model_path, ai4exomars_path=self.config.inference.ai4exomars_path
+        )
+        if imagery_path is None or imagery_path.stem != mosaic_stem:
+            QMessageBox.information(
+                self, "Can't locate this thumbnail",
+                f"Couldn't find the source image ({mosaic_stem!r}) for this "
+                "thumbnail on disk -- it may have moved, or come from a "
+                "different checkpoint's training run than the one loaded here.",
+            )
+            self.status_label.setText("Ready")
+            return
+
+        already_open = (
+            self.session is not None
+            and self.session.raster.path is not None
+            and Path(self.session.raster.path).resolve() == imagery_path.resolve()
+        )
+        if not already_open:
+            self.status_label.setText(
+                f"Opening {imagery_path.name} (this may take a while for a large mosaic)..."
+            )
+            QApplication.processEvents()
+            self._load_observation(imagery_path)
+            if not self.session:
+                return  # load failed/cancelled; _load_observation already reported it
+
+        block_idx = self.session.grid.block_index_at_pixel(col, row)
+        self.session.move_to_block(block_idx)
+        self._set_view("panel")
+        self._refresh_history()
+        self._set_zoom(4)
+        self.status_label.setText(f"Jumped to {source_id}")
 
     def _update_history_panel(self):
         """Swap the history placeholder for the real panel (by reference)."""
@@ -705,18 +851,31 @@ class MainWindow(QMainWindow):
         )
         history.on_panel_selected = self._on_panel_selected
         history.setMaximumWidth(200)
-        old_item = self.main_layout.replaceWidget(self.history_panel, history)
-        if old_item is not None and old_item.widget() is not None:
-            old_item.widget().deleteLater()
+        # QSplitter (main_layout) has no replaceWidget() (that's QLayout-only):
+        # insert the new widget at the old one's index, then detach the old one
+        # synchronously so the splitter never briefly shows both.
+        old_widget = self.history_panel
+        old_index = self.main_layout.indexOf(old_widget)
+        self.main_layout.insertWidget(old_index, history)
+        old_widget.setParent(None)
+        old_widget.deleteLater()
         self.history_panel = history
 
     def _update_legend_panel(self):
         """Swap the legend placeholder for the real legend (by reference)."""
         legend = LegendPanel(self.classes_scheme)
         legend.on_summary_clicked = self._show_class_summary
-        old_item = self.right_layout.replaceWidget(self.legend_panel, legend)
-        if old_item is not None and old_item.widget() is not None:
-            old_item.widget().deleteLater()
+        # The legend is its own QSplitter column now, and QSplitter has no
+        # replaceWidget() (that's QLayout-only) -- same insert-then-detach
+        # pattern as _update_history_panel, and it must preserve the column's
+        # current width so a user-dragged legend width survives the swap.
+        old_widget = self.legend_panel
+        old_index = self.main_layout.indexOf(old_widget)
+        sizes = self.main_layout.sizes()
+        self.main_layout.insertWidget(old_index, legend)
+        old_widget.setParent(None)
+        old_widget.deleteLater()
+        self.main_layout.setSizes(sizes)
         self.legend_panel = legend
 
     def _load_current_panel(self):
@@ -861,13 +1020,43 @@ class MainWindow(QMainWindow):
             self.canvas.set_scalar_overlay(values)
             return
 
+        panel_blocks = grid.get_panel_blocks(self.current_panel_idx)
+        if self.prediction_render_mode == "pixelwise" and any(
+            b.block_id in self.block_pixel_predictions for b in panel_blocks
+        ):
+            pixel_ids = self._build_pixel_class_array(panel_blocks)
+            self.canvas.set_pixel_class_overlay(pixel_ids, self._class_colors())
+            return
+
         block_data = np.full(
             (grid.blocks_per_panel_row, grid.blocks_per_panel_col), -3, dtype=np.int16
         )
-        for block in grid.get_panel_blocks(self.current_panel_idx):
+        for block in panel_blocks:
             record = self.session.labels.get_record(block.block_id)
             block_data[block.block_row, block.block_col] = record.class_id
         self.canvas.set_label_overlay(block_data, self._class_colors())
+
+    def _build_pixel_class_array(self, panel_blocks: list) -> np.ndarray:
+        """Native-resolution (panel h x panel w) array of per-pixel predicted
+        class ids for the current panel, stitched from block_pixel_predictions'
+        cached per-block crops. A block with no cached crop (not yet predicted,
+        or skipped as nodata) is left at -1 (transparent when rendered) --
+        callers only take this path once at least one block in the panel has
+        one; a fully-missing panel falls back to the blockwise render instead.
+        """
+        grid = self.session.grid
+        _, _, panel_w, panel_h = grid.get_panel_coords(self.current_panel_idx)
+        pixel_ids = np.full((panel_h, panel_w), -1, dtype=np.int16)
+        for block in panel_blocks:
+            crop = self.block_pixel_predictions.get(block.block_id)
+            if crop is None:
+                continue
+            y0 = block.block_row * grid.block_size
+            x0 = block.block_col * grid.block_size
+            y1 = min(y0 + crop.shape[0], panel_h)
+            x1 = min(x0 + crop.shape[1], panel_w)
+            pixel_ids[y0:y1, x0:x1] = crop[: y1 - y0, : x1 - x0]
+        return pixel_ids
 
     def _panel_block_map(self) -> dict:
         """(block_row, block_col) → BlockInfo for the current panel."""

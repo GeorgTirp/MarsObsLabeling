@@ -17,6 +17,7 @@ Opened from the Legend panel's Summary button. For each configured class, shows:
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QDialog,
@@ -37,8 +38,32 @@ NPCA_COMPONENTS_SHOWN = 4
 NPCA_THUMBNAILS_PER_COMPONENT = 3
 
 
+class ClickableThumbnail(QLabel):
+    """A Neural-PCA gallery thumbnail that emits its provenance `source_id`
+    when clicked -- MainWindow uses this to jump to that block's location
+    (opening its source image first if a different one is currently loaded;
+    see MainWindow._on_npca_thumbnail_clicked)."""
+
+    clicked = Signal(str)  # source_id
+
+    def __init__(self, source_id: str, parent=None):
+        super().__init__(parent)
+        self._source_id = source_id
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._source_id)
+        super().mousePressEvent(event)
+
+
 class ClassSummaryDialog(QDialog):
-    """Non-modal-ish (but exec()'d like other dialogs here) per-class summary window."""
+    """Per-class summary window. Shown non-modally (MainWindow.show()s it,
+    doesn't exec() it) so a Neural-PCA thumbnail click can navigate
+    MainWindow to that block's location while this window stays open and
+    visible alongside it."""
+
+    thumbnail_clicked = Signal(str)  # source_id, forwarded from whichever ClickableThumbnail was clicked
 
     def __init__(
         self,
@@ -179,10 +204,14 @@ class ClassSummaryDialog(QDialog):
                 missing.setStyleSheet("color: #666; font-size: 10px;")
                 thumbnails_row.addWidget(missing)
             for item in items[:NPCA_THUMBNAILS_PER_COMPONENT]:
-                thumb_label = QLabel()
+                thumb_label = ClickableThumbnail(item.source_id)
                 qimage = numpy_to_qimage(item.thumbnail)
                 thumb_label.setPixmap(QPixmap.fromImage(qimage))
-                thumb_label.setToolTip(f"rank {item.rank}, score={item.score:.3f}\n{item.source_id}")
+                thumb_label.setToolTip(
+                    f"rank {item.rank}, score={item.score:.3f}\n{item.source_id}\n"
+                    "Click to jump to this location"
+                )
+                thumb_label.clicked.connect(self.thumbnail_clicked)
                 thumbnails_row.addWidget(thumb_label)
             col_layout.addLayout(thumbnails_row)
 

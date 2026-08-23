@@ -142,6 +142,34 @@ def test_panel_canvas_scalar_overlay_reuses_label_overlay_slot(qapp):
     assert item_after_class is item_after_scalar  # same QGraphicsPixmapItem, repainted
 
 
+def test_panel_canvas_set_pixel_class_overlay(qapp):
+    """Test setting the per-pixel ("pixel-wise") semantic-segmentation overlay."""
+    canvas = PanelCanvas()
+    canvas.set_grid(8, 8)
+
+    class_ids = np.zeros((400, 400), dtype=np.int16)  # native resolution, != canvas size
+    class_ids[:200, :] = 1
+    class_colors = {0: "#FF0000", 1: "#00FF00"}
+    canvas.set_pixel_class_overlay(class_ids, class_colors)
+
+    assert canvas.label_overlay_item is not None
+
+
+def test_panel_canvas_pixel_class_overlay_reuses_label_overlay_slot(qapp):
+    """Same slot-reuse convention as set_scalar_overlay -- pixel-wise and
+    block-wise class overlays must swap the same item, not stack."""
+    canvas = PanelCanvas()
+    canvas.set_grid(8, 8)
+
+    canvas.set_label_overlay(np.zeros((8, 8), dtype=np.int16), {0: "#FF0000"})
+    item_after_block = canvas.label_overlay_item
+
+    canvas.set_pixel_class_overlay(np.zeros((100, 100), dtype=np.int16), {0: "#FF0000"})
+    item_after_pixel = canvas.label_overlay_item
+
+    assert item_after_block is item_after_pixel
+
+
 def test_panel_canvas_highlight(qapp):
     """Test setting current block highlight."""
     canvas = PanelCanvas()
@@ -181,6 +209,16 @@ def test_legend_panel_creation(qapp, tmp_config_dir):
     legend = LegendPanel(classes_scheme)
 
     assert legend is not None
+
+
+def test_legend_panel_has_no_maximum_width_cap(qapp, tmp_config_dir):
+    """Regression guard: LegendPanel used to hard-cap at 250px, which blocked
+    dragging MainWindow's splitter wider to see full class names/hotkeys."""
+    classes_scheme = load_classes(tmp_config_dir / "classes.yaml")
+    legend = LegendPanel(classes_scheme)
+
+    assert legend.maximumWidth() > 100_000  # Qt's QWIDGETSIZE_MAX sentinel, i.e. "uncapped"
+    assert legend.minimumWidth() > 0  # still can't be dragged to nothing
 
 
 def test_legend_panel_has_summary_button(qapp, tmp_config_dir):

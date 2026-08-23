@@ -225,3 +225,72 @@ def create_current_block_highlight(
 
     painter.end()
     return pixmap
+
+
+def _nearest_neighbor_resize(data: np.ndarray, out_height: int, out_width: int) -> np.ndarray:
+    """Resize a 2D array by nearest-neighbor index selection (no averaging).
+
+    Discrete class ids must never be interpolated -- averaging class 2 and
+    class 5 does not mean class 3.5 -- so this is used instead of QImage's own
+    (bilinear/smooth) scaling for per-pixel class overlays. Downsampling only
+    in practice (a native panel crop is >= the canvas it's decimated to), but
+    correct for upsampling too.
+    """
+    in_height, in_width = data.shape
+    if in_height == out_height and in_width == out_width:
+        return data
+    row_idx = (np.arange(out_height) * in_height // max(out_height, 1)).clip(0, in_height - 1)
+    col_idx = (np.arange(out_width) * in_width // max(out_width, 1)).clip(0, in_width - 1)
+    return data[row_idx[:, None], col_idx]
+
+
+def create_pixel_class_overlay(
+    class_ids: np.ndarray,
+    class_colors: dict[int, str],
+    out_width: int,
+    out_height: int,
+    alpha: float = 0.5,
+) -> QPixmap:
+    """Per-pixel colored overlay for a full semantic-segmentation prediction
+    map -- the pixel-wise counterpart to create_block_overlay's per-block one.
+
+    Args:
+        class_ids: 2D array (native resolution, any size) of predicted class
+            ids; values with no entry in class_colors (including any sentinel
+            used for "no prediction here", e.g. -1) render fully transparent.
+        class_colors: class_id -> hex color.
+        out_width, out_height: canvas size to decimate to (nearest-neighbor).
+        alpha: alpha blend factor (0-1).
+
+    Returns:
+        QPixmap (out_width x out_height) with transparent background and
+        colored pixels.
+    """
+    resized = _nearest_neighbor_resize(class_ids, out_height, out_width).astype(np.int32)
+
+    # Size the table to cover every id actually present, not just the known
+    # ones -- an id with no entry in class_colors (unknown/out-of-range, not
+    # just the -1 "no prediction" sentinel) must land on the table's
+    # zero-initialized default (transparent), never get folded into some
+    # unrelated known class by a clip.
+    known_ids = list(class_colors.keys())
+    max_known = max(known_ids) if known_ids else -1
+    max_seen = int(resized.max()) if resized.size else -1
+    max_id = max(max_known, max_seen)
+
+    # +1 offset: table index 0 is reserved for "no known color" (unmapped ids,
+    # including the -1 nodata/no-prediction sentinel), fully transparent.
+    lut = np.zeros((max_id + 2, 4), dtype=np.uint8)
+    for class_id, hex_color in class_colors.items():
+        if class_id < 0:
+            continue
+        color = QColor(hex_color)
+        lut[class_id + 1] = (color.red(), color.green(), color.blue(), int(round(255 * alpha)))
+
+    # max_id already covers resized's true max, so this only guards against a
+    # sentinel more negative than -1, which shouldn't occur in practice.
+    safe_ids = np.clip(resized, -1, max_id)
+    rgba = np.ascontiguousarray(lut[safe_ids + 1])  # (out_height, out_width, 4) uint8
+
+    qimage = QImage(rgba.data, out_width, out_height, out_width * 4, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimage)

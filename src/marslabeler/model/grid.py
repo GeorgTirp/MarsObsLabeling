@@ -114,6 +114,24 @@ class Grid:
         block_idx = panel_idx * self.blocks_per_panel + local_block_idx
         return self.get_block(block_idx)
 
+    def block_index_at_pixel(self, x_px: int, y_px: int) -> int:
+        """Global block index of the block containing pixel (x_px, y_px),
+        clamped to the image bounds -- e.g. for "jump to this known map
+        location" navigation (a Neural-PCA gallery thumbnail's source pixel
+        coordinates, a search result, ...). Matches _build_block_index's own
+        panel-major, then row-major-within-panel ordering exactly, so this is
+        a direct arithmetic inverse of it rather than a search.
+        """
+        x_px = max(0, min(int(x_px), self.img_width - 1))
+        y_px = max(0, min(int(y_px), self.img_height - 1))
+        panel_col = x_px // self.panel_size
+        panel_row = y_px // self.panel_size
+        panel_idx = panel_row * self.panels_across + panel_col
+        local_block_col = (x_px % self.panel_size) // self.block_size
+        local_block_row = (y_px % self.panel_size) // self.block_size
+        local_block_idx = local_block_row * self.blocks_per_panel_col + local_block_col
+        return panel_idx * self.blocks_per_panel + local_block_idx
+
     def get_panel_blocks(self, panel_idx: int) -> list[BlockInfo]:
         """Get all blocks in a panel."""
         if panel_idx < 0 or panel_idx >= self.num_panels:

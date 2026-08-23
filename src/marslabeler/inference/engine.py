@@ -95,8 +95,44 @@ def run_block_inference(
 
     Returns block_id -> predicted class channel index (0-based, as emitted by the
     model -- caller maps this through ClassScheme.model_index_to_id()).
+
+    Thin wrapper around `run_block_inference_with_pixel_maps` (keep_pixel_maps=False)
+    kept as its own function so existing callers/tests see the exact same
+    dict-only return type as before pixel-map retention existed.
     """
-    results: dict[str, int] = {}
+    majority, _ = run_block_inference_with_pixel_maps(
+        raster, blocks, plan, predict_fn,
+        progress_cb=progress_cb, should_cancel=should_cancel,
+        keep_pixel_maps=False,
+    )
+    return majority
+
+
+def run_block_inference_with_pixel_maps(
+    raster: RasterLike,
+    blocks: Sequence[BlockInfo],
+    plan: InferencePlan,
+    predict_fn: PredictFn,
+    progress_cb: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    *,
+    keep_pixel_maps: bool = True,
+) -> tuple[dict[str, int], dict[str, np.ndarray]]:
+    """Run `predict_fn` over `blocks` in batches, majority-voting each block's crop
+    -- and, when `keep_pixel_maps` is True, also keeping each block's own raw
+    per-pixel predicted-class crop (uint8), so a caller can offer a pixel-level
+    ("semantic segmentation") view without a second, separately-priced inference
+    pass over the same imagery. `keep_pixel_maps=False` skips building that
+    second dict (same memory profile as `run_block_inference`) when only the
+    majority-voted label is needed.
+
+    Returns (block_id -> predicted class channel index, block_id -> (h_px, w_px)
+    uint8 array of per-pixel predicted class channel indices [empty dict if
+    keep_pixel_maps=False]). Channel indices are 0-based, as emitted by the model
+    -- caller maps both through ClassScheme.model_index_to_id().
+    """
+    majority: dict[str, int] = {}
+    pixel_maps: dict[str, np.ndarray] = {}
     for batch, local_stack, context_stack in _iter_batches(
         raster, blocks, plan, progress_cb, should_cancel
     ):
@@ -108,8 +144,10 @@ def run_block_inference(
             )
         for block, pixel_classes in zip(batch, predicted):
             crop = pixel_classes[: block.h_px, : block.w_px]
-            results[block.block_id] = _majority_class(crop)
-    return results
+            majority[block.block_id] = _majority_class(crop)
+            if keep_pixel_maps:
+                pixel_maps[block.block_id] = crop.astype(np.uint8)
+    return majority, pixel_maps
 
 
 def run_block_scores(

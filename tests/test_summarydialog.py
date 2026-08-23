@@ -10,7 +10,7 @@ from marslabeler.io.raster import RasterSource
 from marslabeler.model.grid import Grid
 from marslabeler.model.labelstore import LabelStore
 from marslabeler.model.session import Session
-from marslabeler.ui.summarydialog import ClassSummaryDialog
+from marslabeler.ui.summarydialog import ClassSummaryDialog, ClickableThumbnail
 
 
 @pytest.fixture(scope="session")
@@ -145,3 +145,88 @@ def test_summary_dialog_builds_with_npca_gallery(qapp, classes_scheme, test_sess
     gallery = {0: {0: [FakeThumbnail(1, 0.9)], 1: [FakeThumbnail(1, 0.5)]}}
     dialog = ClassSummaryDialog(classes_scheme, test_session, npca_gallery=gallery)
     assert dialog is not None
+
+
+class _FakeThumbnail:
+    def __init__(self, rank, score, source_id):
+        self.rank = rank
+        self.score = score
+        self.thumbnail = np.zeros((16, 16), dtype=np.uint8)
+        self.source_id = source_id
+
+
+def _left_click(widget) -> None:
+    """QLabel has no built-in click() -- simulate a left-button press directly."""
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    event = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        QPointF(1, 1),
+        QPointF(1, 1),
+        Qt.MouseButton.LeftButton,
+        Qt.MouseButton.LeftButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    widget.mousePressEvent(event)
+
+
+def test_clickable_thumbnail_emits_its_own_source_id_on_click(qapp):
+    thumb = ClickableThumbnail("mosaic_100_200")
+    seen = []
+    thumb.clicked.connect(seen.append)
+
+    _left_click(thumb)
+
+    assert seen == ["mosaic_100_200"]
+
+
+def test_clickable_thumbnail_ignores_non_left_clicks(qapp):
+    from PySide6.QtCore import QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    thumb = ClickableThumbnail("mosaic_1_2")
+    seen = []
+    thumb.clicked.connect(seen.append)
+
+    event = QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress,
+        QPointF(1, 1),
+        QPointF(1, 1),
+        Qt.MouseButton.RightButton,
+        Qt.MouseButton.RightButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    thumb.mousePressEvent(event)
+
+    assert seen == []
+
+
+def test_summary_dialog_forwards_thumbnail_clicks_with_correct_source_id(qapp, classes_scheme, test_session):
+    """Each of several thumbnails must forward its OWN source_id, not a stale
+    shared value from whichever was built last."""
+    gallery = {
+        0: {0: [_FakeThumbnail(1, 0.9, "mosaic_10_20")]},
+        1: {0: [_FakeThumbnail(1, 0.8, "mosaic_30_40")]},
+    }
+    dialog = ClassSummaryDialog(classes_scheme, test_session, npca_gallery=gallery)
+
+    thumbnails = {t._source_id: t for t in dialog.findChildren(ClickableThumbnail)}
+    assert set(thumbnails.keys()) == {"mosaic_10_20", "mosaic_30_40"}
+
+    seen = []
+    dialog.thumbnail_clicked.connect(seen.append)
+
+    _left_click(thumbnails["mosaic_30_40"])
+    assert seen == ["mosaic_30_40"]
+
+    _left_click(thumbnails["mosaic_10_20"])
+    assert seen == ["mosaic_30_40", "mosaic_10_20"]
+
+
+def test_summary_dialog_thumbnail_tooltip_mentions_jump(qapp, classes_scheme, test_session):
+    gallery = {0: {0: [_FakeThumbnail(1, 0.9, "mosaic_10_20")]}}
+    dialog = ClassSummaryDialog(classes_scheme, test_session, npca_gallery=gallery)
+    thumb = dialog.findChildren(ClickableThumbnail)[0]
+    assert "mosaic_10_20" in thumb.toolTip()
+    assert "jump" in thumb.toolTip().lower()

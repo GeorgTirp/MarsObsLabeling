@@ -24,3 +24,27 @@ def load_npca_gallery(path: str | Path, ai4exomars_path: str | None = None):
     from vision_backend.pc_align.neural_pca import load_gallery
 
     return load_gallery(path)
+
+
+def parse_npca_source_id(source_id: str) -> tuple[str, int, int] | None:
+    """Reverse `fit_neural_pca.py`'s own `source_id` convention --
+    `f"{Path(imagery_path).stem}_{record.col}_{record.row}"` -- back into
+    (imagery_stem, col, row), for "jump to this gallery thumbnail's location"
+    navigation. `col`/`row` are native pixel coordinates in that imagery
+    file's own raster (not whatever observation happens to be open in
+    MarsObsLabeling right now -- see resolve_training_imagery_path).
+
+    Splits from the right (`rsplit("_", 2)`) since the stem itself often
+    contains underscores (e.g. "drg_on_label_grid"); returns None if the last
+    two underscore-separated fields aren't both integers, or the stem is empty.
+    """
+    parts = source_id.rsplit("_", 2)
+    if len(parts) != 3:
+        return None
+    stem, col_str, row_str = parts
+    if not stem:
+        return None
+    try:
+        return stem, int(col_str), int(row_str)
+    except ValueError:
+        return None

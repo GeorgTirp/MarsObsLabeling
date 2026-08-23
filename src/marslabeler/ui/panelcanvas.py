@@ -14,6 +14,7 @@ from marslabeler.ui.render import (
     create_block_overlay,
     create_heatmap_overlay,
     create_current_block_highlight,
+    create_pixel_class_overlay,
 )
 
 
@@ -127,6 +128,32 @@ class PanelCanvas(QGraphicsView):
             block_data,
             class_colors,
             alpha=0.25,
+        )
+
+        if self.label_overlay_item is None:
+            self.label_overlay_item = self.scene.addPixmap(overlay_pixmap)
+        else:
+            self.label_overlay_item.setPixmap(overlay_pixmap)
+
+    def set_pixel_class_overlay(
+        self, class_ids: np.ndarray, class_colors: dict[int, str], alpha: float = 0.5
+    ) -> None:
+        """
+        Set a per-pixel colored class overlay (the "pixel-wise"/semantic-
+        segmentation view), replacing whatever the block-color overlay was
+        showing in the same layer/slot -- same slot-reuse convention as
+        set_scalar_overlay.
+
+        Args:
+            class_ids: 2D array, native resolution (any size -- decimated to
+                canvas size by nearest-neighbor, never blended). Ids with no
+                entry in class_colors (including a negative "no prediction
+                here" sentinel) render fully transparent.
+            class_colors: class_id -> hex color.
+            alpha: Alpha blend factor (0-1).
+        """
+        overlay_pixmap = create_pixel_class_overlay(
+            class_ids, class_colors, self.canvas_width, self.canvas_height, alpha=alpha
         )
 
         if self.label_overlay_item is None:
