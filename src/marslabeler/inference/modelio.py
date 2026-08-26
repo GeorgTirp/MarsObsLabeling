@@ -238,17 +238,42 @@ def build_inference_plan(
     block_size: int,
     batch_size: int = 4,
     context_multiplier: int = 4,
+    gsd_ratio: float = 1.0,
 ) -> InferencePlan:
-    """Round the labeling block size up to the model's required stride."""
+    """Round the labeling block size up to the model's required stride.
+
+    ``gsd_ratio`` is ``observation_gsd / training_gsd``. At 1.0 the model reads
+    native pixels, as before. Otherwise the window read from the observation is
+    divided by the ratio and resampled up to ``pad_size``, so each model pixel
+    spans the ground distance the model was trained on -- a coarser observation
+    (ratio > 1) is read in smaller native windows and magnified.
+    """
     stride = bundle.required_stride
     pad_size = -(-block_size // stride) * stride  # ceil(block_size / stride) * stride
     context_px = pad_size * context_multiplier if bundle.needs_context else 0
+    native_window = pad_size
+    if gsd_ratio and gsd_ratio > 0 and abs(gsd_ratio - 1.0) > 1e-6:
+        native_window = max(1, int(round(pad_size / gsd_ratio)))
     return InferencePlan(
         pad_size=pad_size,
         needs_context=bundle.needs_context,
         context_px=context_px,
         batch_size=max(1, batch_size),
+        native_window=native_window,
     )
+
+
+def native_block_size_for_gsd(block_size: int, stride: int, gsd_ratio: float) -> int:
+    """Block size (native px) whose ground extent matches one model window.
+
+    When a scale correction is active the model window covers fewer native pixels
+    than before, so the labeling grid has to shrink to match -- otherwise a block
+    would extend past the window that predicted it.
+    """
+    pad_size = -(-block_size // stride) * stride
+    if not gsd_ratio or gsd_ratio <= 0 or abs(gsd_ratio - 1.0) <= 1e-6:
+        return block_size
+    return max(1, int(round(pad_size / gsd_ratio)))
 
 
 def _to_tensor(bundle: ModelBundle, batch: np.ndarray, quantization_bounds: tuple[float, float] | None):
@@ -293,6 +318,57 @@ def _forward_logits(
     return bundle.model(local_tensor)
 
 
+# Mars equatorial radius (m), for converting a geographic transform's degrees
+# into metres. NOAH-H's own source tiles are in a geographic CRS while the
+# warped label grid is projected, so a GSD comparison has to handle both.
+MARS_RADIUS_M = 3396190.0
+
+
+def raster_gsd_metres(dataset) -> float | None:
+    """Pixel size in metres for an open rasterio dataset, or None if unknowable.
+
+    A projected CRS already reports metres. A geographic one reports degrees, so
+    it is converted along a meridian (latitude degrees are very nearly constant
+    on a sphere, unlike longitude), which is accurate enough to tell 0.25 m from
+    0.5 m.
+    """
+    try:
+        pixel = abs(dataset.transform.a)
+    except Exception:
+        return None
+    if not pixel or pixel <= 0:
+        return None
+    crs = getattr(dataset, "crs", None)
+    if crs is not None and crs.is_geographic:
+        import math
+
+        return pixel * (math.pi / 180.0) * MARS_RADIUS_M
+    return pixel
+
+
+def training_gsd_metres(
+    checkpoint_path: str | Path, *, ai4exomars_path: str | None = None
+) -> float | None:
+    """GSD of the imagery this checkpoint was trained on, or None if unresolvable.
+
+    Reads the training raster named by the checkpoint's own saved loader config
+    (see `resolve_training_imagery_path`) and measures it, so the comparison is
+    against what the model actually saw rather than an assumed constant.
+    """
+    import rasterio
+
+    imagery_path = resolve_training_imagery_path(
+        checkpoint_path, ai4exomars_path=ai4exomars_path
+    )
+    if imagery_path is None or not Path(imagery_path).exists():
+        return None
+    try:
+        with rasterio.open(str(imagery_path)) as dataset:
+            return raster_gsd_metres(dataset)
+    except Exception:
+        return None
+
+
 def make_predict_fn(bundle: ModelBundle, quantization_bounds: tuple[float, float] | None = None):
     """Numpy-in/numpy-out class prediction, for `inference.engine.run_block_inference`."""
     import torch
@@ -304,6 +380,43 @@ def make_predict_fn(bundle: ModelBundle, quantization_bounds: tuple[float, float
             return predicted.to("cpu").numpy().astype(np.int64)
 
     return predict_fn
+
+
+def make_predict_fn_with_embeddings(
+    bundle: ModelBundle, quantization_bounds: tuple[float, float] | None = None
+):
+    """`make_predict_fn`, plus a sink collecting each block's pooled feature vector.
+
+    Returns ``(predict_fn, embeddings)``. ``embeddings`` is a list that gains one
+    ``[batch, F] float32`` array per batch, in the order the engine feeds them --
+    so concatenating it row-aligns with the `blocks` sequence passed to
+    `run_block_inference*`.
+
+    The features come off the SAME forward pass that produces the predictions
+    (captured on `decoder.head`'s pre-hook, then mean-pooled over H and W), so
+    this costs one extra mean and a copy per batch -- no second pass over the
+    imagery. That pooled vector is phi(x) in the Neural-PCA method; psi_k(x) for
+    any class is just an elementwise product with that class's classifier weight
+    vector, so one capture serves every class.
+    """
+    import torch
+    from vision_backend.model.features import hook_pre_classifier_features
+
+    embeddings: list[np.ndarray] = []
+
+    def predict_fn(local_batch: np.ndarray, context_batch: np.ndarray | None) -> np.ndarray:
+        with torch.no_grad():
+            with hook_pre_classifier_features(bundle.model) as captured:
+                logits = _forward_logits(
+                    bundle, local_batch, context_batch, quantization_bounds
+                )
+                features = captured["features"]  # [B, F, H, W]
+                embeddings.append(
+                    features.mean(dim=(2, 3)).to("cpu").numpy().astype(np.float32)
+                )
+            return logits.argmax(dim=1).to("cpu").numpy().astype(np.int64)
+
+    return predict_fn, embeddings
 
 
 def make_confidence_score_fn(bundle: ModelBundle, quantization_bounds: tuple[float, float] | None = None):

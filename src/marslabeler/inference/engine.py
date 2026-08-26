@@ -36,12 +36,61 @@ ScoreFn = Callable[[np.ndarray, np.ndarray | None], np.ndarray]
 
 @dataclass
 class InferencePlan:
-    """How large a window to feed the model, and whether it needs a context crop."""
+    """How large a window to feed the model, and whether it needs a context crop.
+
+    ``pad_size`` is the model's input size in MODEL pixels. ``native_window`` is
+    how many pixels of the observation are read to fill it. They are equal in the
+    normal case; when the observation's GSD differs from the model's training
+    imagery they diverge, and a smaller native window is resampled up to
+    ``pad_size`` so each model pixel represents the ground distance the model was
+    trained on. Blocks stay indexed in the observation's own native pixels.
+    """
 
     pad_size: int
     needs_context: bool = False
     context_px: int = 0
     batch_size: int = 4
+    native_window: int = 0  # 0 -> same as pad_size (no scale correction)
+
+    @property
+    def read_window_px(self) -> int:
+        """Native pixels read per model window."""
+        return self.native_window or self.pad_size
+
+    @property
+    def model_px_per_native_px(self) -> float:
+        """Scale from the observation's pixels to the model's."""
+        return self.pad_size / float(self.read_window_px)
+
+
+def _block_crop(pixel_output: np.ndarray, block: BlockInfo, plan: InferencePlan) -> np.ndarray:
+    """The part of a model window's output belonging to `block`.
+
+    The window is anchored at the block's origin, so the block occupies the
+    top-left of the output -- but measured in MODEL pixels, which differ from the
+    block's native pixels whenever a scale correction is active. Getting this
+    conversion wrong would crop the wrong region and mislabel the block.
+    """
+    scale = plan.model_px_per_native_px
+    height = min(pixel_output.shape[0], max(0, int(round(block.h_px * scale))))
+    width = min(pixel_output.shape[1], max(0, int(round(block.w_px * scale))))
+    return pixel_output[:height, :width]
+
+
+def _to_native_resolution(crop: np.ndarray, block: BlockInfo) -> np.ndarray:
+    """Resample a model-resolution crop back to the block's own pixel grid.
+
+    Per-pixel class maps are stored and drawn against the observation's native
+    pixels, so a scale-corrected crop has to come back down. Nearest-neighbour:
+    these are class indices, and interpolating between class ids is meaningless.
+    """
+    if crop.shape == (block.h_px, block.w_px) or crop.size == 0:
+        return crop
+    if block.h_px <= 0 or block.w_px <= 0:
+        return crop[:0, :0]
+    rows = np.linspace(0, crop.shape[0] - 1, block.h_px).round().astype(np.int64)
+    cols = np.linspace(0, crop.shape[1] - 1, block.w_px).round().astype(np.int64)
+    return crop[np.ix_(rows, cols)]
 
 
 def _iter_batches(
@@ -67,7 +116,9 @@ def _iter_batches(
         local_stack = np.stack(
             [
                 raster.read_window_padded(
-                    b.x_px, b.y_px, plan.pad_size, plan.pad_size, plan.pad_size, plan.pad_size
+                    b.x_px, b.y_px,
+                    plan.read_window_px, plan.read_window_px,
+                    plan.pad_size, plan.pad_size,
                 )
                 for b in batch
             ]
@@ -143,10 +194,15 @@ def run_block_inference_with_pixel_maps(
                 f"{len(batch)} blocks"
             )
         for block, pixel_classes in zip(batch, predicted):
-            crop = pixel_classes[: block.h_px, : block.w_px]
-            majority[block.block_id] = _majority_class(crop)
+            crop = _block_crop(pixel_classes, block, plan)
+            voted = _majority_class(crop)
+            if voted == NO_PREDICTION:
+                continue  # zero-extent block: leave it unlabeled, don't invent a class
+            majority[block.block_id] = voted
             if keep_pixel_maps:
-                pixel_maps[block.block_id] = crop.astype(np.uint8)
+                pixel_maps[block.block_id] = _to_native_resolution(
+                    crop, block
+                ).astype(np.uint8)
     return majority, pixel_maps
 
 
@@ -176,7 +232,7 @@ def run_block_scores(
                 f"score_fn returned {scored.shape[0]} results for a batch of {len(batch)} blocks"
             )
         for block, pixel_scores in zip(batch, scored):
-            crop = pixel_scores[: block.h_px, : block.w_px]
+            crop = _block_crop(pixel_scores, block, plan)
             results[block.block_id] = float(np.mean(crop)) if crop.size else 0.0
     return results
 
@@ -229,9 +285,18 @@ def _context_window(raster: RasterLike, block: BlockInfo, plan: InferencePlan) -
     )
 
 
+NO_PREDICTION = -1
+
+
 def _majority_class(crop: np.ndarray) -> int:
-    """Most frequent predicted class index within a block's crop."""
+    """Most frequent predicted class index within a block's crop.
+
+    Returns NO_PREDICTION for an empty crop. A block with no pixels of its own
+    (one whose origin lies past the image edge, so w_px or h_px is 0) has nothing
+    to vote on; returning 0 here would silently assert class 0 for it and paint
+    the overlay out over the black margin beyond the swath.
+    """
     if crop.size == 0:
-        return 0
+        return NO_PREDICTION
     counts = np.bincount(crop.ravel().astype(np.int64))
     return int(np.argmax(counts))

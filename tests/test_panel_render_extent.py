@@ -72,13 +72,13 @@ def _spy_reads(window):
     real_padded = raster.read_window_padded
     real_plain = raster.read_window
 
-    def padded(x, y, w, h, ow, oh):
+    def padded(x, y, w, h, ow, oh, **kwargs):
         calls["padded"].append((w, h))
-        return real_padded(x, y, w, h, ow, oh)
+        return real_padded(x, y, w, h, ow, oh, **kwargs)
 
-    def plain(x, y, w, h, ow, oh):
+    def plain(x, y, w, h, ow, oh, **kwargs):
         calls["plain"].append((w, h))
-        return real_plain(x, y, w, h, ow, oh)
+        return real_plain(x, y, w, h, ow, oh, **kwargs)
 
     raster.read_window_padded = padded
     raster.read_window = plain

@@ -51,6 +51,8 @@ class MainWindow(QMainWindow):
         self,
         config_path: Path = None,
         resolution_m: Optional[float] = None,
+        ignore_cached_predictions: bool = False,
+        match_training_gsd: bool | None = None,
         predictions_mode: bool = False,
     ):
         super().__init__()
@@ -82,6 +84,10 @@ class MainWindow(QMainWindow):
         self.block_confidence: dict[str, float] = {}  # block_id -> mean softmax confidence
         self.block_uncertainty: dict[str, float] = {}  # block_id -> mean epistemic (Mahalanobis) uncertainty
         self.npca_gallery: Optional[dict] = None  # class model_index -> component -> ranked thumbnails
+        # Same shape, but ranked over THIS observation's blocks (built during
+        # the prediction pass); its items carry block ids, so clicking one
+        # navigates the open image instead of the training corpus.
+        self.local_npca_gallery: dict = {}
 
         # Which granularity the "classes" display_layer renders at: "pixelwise"
         # (each pixel colored by its own predicted class -- the model's raw
@@ -99,6 +105,15 @@ class MainWindow(QMainWindow):
         # Optional classification tile resolution override (meters/tile-side), from
         # --resolution. None -> use config.geometry.block_size unchanged.
         self.resolution_m = resolution_m
+        # --fresh: ignore any saved predictions/session for the observation, so
+        # inference re-runs (restoring the pixel-wise view, per-block confidence
+        # and the local Neural-PCA gallery, all of which are memory-only products
+        # of the prediction pass) and the requested --resolution actually applies.
+        self.ignore_cached_predictions = bool(ignore_cached_predictions)
+        # None -> ask when a mismatch is found; True/False -> decided on the CLI.
+        self.match_training_gsd = match_training_gsd
+        # observation_gsd / training_gsd actually in force; 1.0 = native pixels.
+        self.gsd_ratio = 1.0
 
         # Where labels are saved to / resumed from. Starts at the config default;
         # changeable via File -> Set Labels Folder... (applies to the next Open).
@@ -154,6 +169,14 @@ class MainWindow(QMainWindow):
         self.canvas.on_block_paint_end = self._on_block_paint_end
         self.canvas.on_selection_made = self._on_selection_made
         main_layout.addWidget(self.canvas)
+        # The Class Summary replaces the canvas IN THIS COLUMN rather than opening
+        # its own window: on macOS a non-modal child of a fullscreen/maximised
+        # window is placed on a different Space and never surfaces, so "open"
+        # succeeds while nothing appears. Swapping the centre pane (the same
+        # insert-then-detach idiom the legend/history swaps use) can't be lost
+        # behind anything, and leaves the splitter's own geometry untouched.
+        self._summary_page = None
+        self._showing_summary = False
 
         # Legend column (placeholder until a session loads and classes are known)
         self.legend_panel = QLabel("(No session)")
@@ -191,6 +214,16 @@ class MainWindow(QMainWindow):
         # crops actually exist (_run_prediction populates them; a cache-hit
         # reload of previously-saved predictions never does, see
         # block_pixel_predictions's docstring in __init__).
+        # Pixel maps, per-block confidence and the local Neural-PCA gallery are
+        # products of the prediction pass held in memory only (the .parquet cache
+        # stores one class id per block), so a cache hit leaves all three empty.
+        # This re-runs inference to rebuild them without restarting the app.
+        self.rerun_button = QPushButton("\u21BB Re-run inference")
+        self.rerun_button.setEnabled(False)
+        self.rerun_button.setVisible(self.predictions_mode)
+        self.rerun_button.clicked.connect(self._rerun_inference)
+        right_layout.addWidget(self.rerun_button)
+
         self.render_mode_button = QPushButton("\U0001F5FA Pixel-wise view")
         self.render_mode_button.setEnabled(False)
         self.render_mode_button.setCheckable(True)
@@ -374,7 +407,8 @@ class MainWindow(QMainWindow):
                 # labels line up (the requested --resolution is ignored for this image).
                 saved_block, saved_panel = saved.get("block_size"), saved.get("panel_size")
                 if (
-                    saved_block is not None
+                    not self.ignore_cached_predictions
+                    and saved_block is not None
                     and saved_panel is not None
                     and (saved_block != block_size or saved_panel != panel_size)
                 ):
@@ -389,6 +423,26 @@ class MainWindow(QMainWindow):
                         "different labels folder or remove the saved files first.",
                     )
                     block_size, panel_size = saved_block, saved_panel
+
+            # Scale decision before anything expensive: it changes the tile size,
+            # so it has to happen before the grid and the preprocessing pass.
+            self.gsd_ratio = self._resolve_gsd_scaling(raster)
+            if self.gsd_ratio != 1.0:
+                from marslabeler.inference.modelio import (
+                    REQUIRED_STRIDE,
+                    native_block_size_for_gsd,
+                )
+
+                # One model window now covers fewer native pixels, so the tile has
+                # to shrink to match -- otherwise a block would extend beyond the
+                # window that predicted it.
+                stride = REQUIRED_STRIDE.get("simmim", 256)
+                block_size = native_block_size_for_gsd(block_size, stride, self.gsd_ratio)
+                panel_size = max(block_size, (panel_size // block_size) * block_size)
+                self.status_label.setText(
+                    f"Scale-matched tiles: {block_size}px "
+                    f"({block_size * raster.gsd:g} m/side)"
+                )
 
             # Warn before committing to an impractically large tile count (mirrors the
             # Grid's own block-indexing: full blocks_per_panel for every panel).
@@ -436,6 +490,18 @@ class MainWindow(QMainWindow):
                 labeler=self.config.labeler or "unknown",
             )
 
+            # A restored session carries the class NAMES that were current when it
+            # was saved; class_id is authoritative, so re-derive them rather than
+            # letting a renamed class show its old label in exports and details.
+            if self.classes_scheme is not None:
+                id_to_name = {c.id: c.name for c in self.classes_scheme.classes.values()}
+                id_to_name[self.classes_scheme.abstain.id] = self.classes_scheme.abstain.name
+                id_to_name[self.classes_scheme.nodata.id] = self.classes_scheme.nodata.name
+                renamed = self.session.labels.refresh_class_names(id_to_name)
+                if renamed:
+                    print(f"[session] refreshed {renamed} stale class names from "
+                          f"{self.config.paths.classes_file}")
+
             # Create keyboard controller
             self.controller = KeyboardController(self.session, self.classes_scheme)
             self.controller.on_label_changed = self._on_labels_changed
@@ -459,6 +525,8 @@ class MainWindow(QMainWindow):
 
             # Store skip decisions for later use
             self.skip_decisions = preprocess_dialog.get_skip_decisions()
+            # Share them so navigation doesn't re-decode a window per block.
+            self.session.skip_decisions = self.skip_decisions
 
             # Detect fully off-swath panels: retire them (mark nodata), hide + skip
             self.empty_panels = self._compute_empty_panels()
@@ -540,11 +608,16 @@ class MainWindow(QMainWindow):
         self.render_mode_button.setChecked(False)
         self.render_mode_button.setText("\U0001F5FA Pixel-wise view")
         self.npca_gallery = self._try_load_npca_gallery(model_path)
+        self.local_npca_gallery = {}
 
         model_sig = self._model_signature(model_path)
         obs_id = jp2_path.stem
         saved = Session.read_saved_metadata(self.labels_dir, obs_id)
-        cache_valid = saved is not None and saved.get("model_sig") == model_sig
+        cache_valid = (
+            saved is not None
+            and saved.get("model_sig") == model_sig
+            and not self.ignore_cached_predictions
+        )
         if saved is not None and not cache_valid:
             QMessageBox.information(
                 self,
@@ -561,12 +634,98 @@ class MainWindow(QMainWindow):
         self.save_predictions_button.setEnabled(True)
         self.uncertainty_button.setEnabled(True)
 
+        self.rerun_button.setEnabled(True)
         if cache_valid:
             self._model_sig = model_sig
+            note = (
+                "Pixel-wise view, per-block confidence and this observation's "
+                "Neural-PCA gallery are rebuilt by the inference pass and are not "
+                "stored in the prediction cache -- use \u21BB Re-run inference "
+                "for them."
+            )
+            self.render_mode_button.setToolTip(note)
+            self.uncertainty_button.setToolTip(note)
             self.status_label.setText(f"Loaded cached predictions ({model_id}) for {obs_id}")
             return
 
         self._run_prediction(model_path, model_sig)
+
+    def _resolve_gsd_scaling(self, raster) -> float:
+        """Decide the observation/training GSD ratio to run at, asking if needed.
+
+        A segmentation model learns terrain at a fixed pixels-per-metre, so
+        imagery of a different GSD is a scale domain shift: the same landform
+        covers a different number of pixels than in any training crop. Measured on
+        labelled NOAH-H ground at a 2.07x mismatch, correcting the scale is worth
+        about +40% mIoU for ~4x the compute, so it is offered rather than assumed.
+
+        Returns the ratio to hand `build_inference_plan`; 1.0 means "read native
+        pixels", i.e. no correction.
+        """
+        import math
+
+        from marslabeler.inference.modelio import raster_gsd_metres, training_gsd_metres
+
+        dataset = getattr(raster, "_dataset", None)
+        observed = raster_gsd_metres(dataset) if dataset is not None else None
+        if not observed:
+            return 1.0
+
+        reference = None
+        source = ""
+        if self.model_path is not None:
+            reference = training_gsd_metres(
+                self.model_path, ai4exomars_path=self.config.inference.ai4exomars_path
+            )
+            if reference:
+                source = f"the imagery {self.model_path.stem} was trained on"
+        if not reference:
+            reference = float(self.config.inference.expected_gsd_m)
+            source = "the expected NOAH-H product scale (inference.expected_gsd_m)"
+        if reference <= 0:
+            return 1.0
+
+        ratio = observed / reference
+        if abs(math.log2(ratio)) <= float(self.config.inference.gsd_log2_tolerance):
+            return 1.0
+
+        direction = "coarser" if ratio > 1 else "finer"
+        detail = (
+            f"This observation is {observed:.4g} m/pixel, but {source} is "
+            f"{reference:.4g} m/pixel -- {ratio:.2f}x {direction}.\n\n"
+            "Matching the training scale resamples each window so a model pixel "
+            f"spans {reference:.4g} m again. On labelled NOAH-H ground at this "
+            "mismatch that was worth about +40% mIoU, but it needs roughly "
+            f"{ratio ** 2:.0f}x the inference time.\n\n"
+            "Running natively is faster, but predictions are not comparable to "
+            "the model's validation scores."
+        )
+
+        if self.match_training_gsd is not None:
+            # Decided on the command line -- report, don't ask.
+            choice = bool(self.match_training_gsd)
+            self.status_label.setText(
+                f"{observed:.4g} m/px vs {reference:.4g} m/px training scale; "
+                f"{'matching' if choice else 'running native'}"
+            )
+        else:
+            answer = QMessageBox.question(
+                self, "Resolution mismatch",
+                detail + "\n\nMatch the training scale?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            choice = answer == QMessageBox.StandardButton.Yes
+
+        if not choice:
+            self.status_label.setText(
+                f"Warning: running at {observed:.4g} m/px, {ratio:.2f}x {direction} "
+                f"than the {reference:.4g} m/px training scale"
+            )
+            return 1.0
+        print(f"[gsd] matching training scale: {observed:.4g} -> {reference:.4g} m/px "
+              f"(ratio {ratio:.3f})")
+        return ratio
 
     def _retire_high_nodata_blocks(self) -> int:
         """Mark blocks above inference.nodata_skip_threshold nodata as nodata.
@@ -588,6 +747,30 @@ class MainWindow(QMainWindow):
         if ids:
             self.session.labels.set_nodata_bulk(ids)
         return len(ids)
+
+    def _rerun_inference(self) -> None:
+        """Re-run inference over the open observation, replacing cached predictions.
+
+        Needed because the prediction cache stores one class id per block; the
+        per-pixel maps, per-block confidence and the per-observation Neural-PCA
+        gallery live only in memory for the lifetime of a prediction run.
+        """
+        if not self.session or not self.model_path:
+            return
+        if not self.predictions_mode:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Re-run inference?",
+            "Re-run the model over every non-nodata block of this observation?\n\n"
+            "This replaces the current predictions and restores the pixel-wise "
+            "view, per-block confidence and this observation's Neural-PCA gallery.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._run_prediction(self.model_path, self._model_signature(self.model_path))
 
     def _run_prediction(self, model_path: Path, model_sig: str) -> None:
         """Run the model over every non-nodata block and seed the results as labels."""
@@ -617,6 +800,7 @@ class MainWindow(QMainWindow):
                 "ai4exomars_path": self.config.inference.ai4exomars_path,
                 "batch_size": self.config.inference.batch_size,
                 "context_multiplier": self.config.inference.context_multiplier,
+                "gsd_ratio": self.gsd_ratio,
             },
         )
         dialog.start()
@@ -633,6 +817,7 @@ class MainWindow(QMainWindow):
         self.session.labels.seed_bulk(predictions, class_names)
         self.block_confidence = dialog.get_confidence()
         self.block_pixel_predictions = dialog.get_pixel_predictions()
+        self.local_npca_gallery = dialog.get_local_npca()
         self.render_mode_button.setEnabled(bool(self.block_pixel_predictions))
         self._model_sig = model_sig
 
@@ -737,6 +922,7 @@ class MainWindow(QMainWindow):
                 "ai4exomars_path": self.config.inference.ai4exomars_path,
                 "batch_size": self.config.inference.batch_size,
                 "context_multiplier": self.config.inference.context_multiplier,
+                "gsd_ratio": self.gsd_ratio,
             },
         )
         dialog.start()
@@ -751,31 +937,120 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Computed uncertainty for {len(self.block_uncertainty)} blocks")
 
     def _show_class_summary(self) -> None:
-        """Legend panel's Summary button: open (or re-focus) the per-class
-        summary window. Shown non-modally -- see _on_npca_thumbnail_clicked --
-        so it can stay open and visible while this window navigates."""
-        if not self.session or not self.classes_scheme:
+        """Legend panel's Summary button: swap the centre view to the class summary.
+
+        Shown in-window (replacing the canvas in the centre column) rather than as a separate
+        dialog: on macOS a non-modal child window of a fullscreen/maximised parent
+        opens on another Space, so the old dialog reported itself open while
+        nothing became visible. Clicking Summary again returns to the map.
+        """
+        if self._showing_summary:
+            self._close_class_summary()
+            return
+        if not self.session:
+            self.status_label.setText("Summary needs an observation loaded first.")
+            return
+        if not self.classes_scheme:
+            self.status_label.setText(
+                "Summary unavailable: the class scheme failed to load "
+                f"({self.config.paths.classes_file})."
+            )
             return
 
-        if self._summary_dialog is not None:
-            self._summary_dialog.close()
-            self._summary_dialog.deleteLater()
+        from marslabeler.ui.summarydialog import ClassSummaryView
 
-        from marslabeler.ui.summarydialog import ClassSummaryDialog
+        try:
+            view = ClassSummaryView(
+                self.classes_scheme,
+                self.session,
+                npca_gallery=self.npca_gallery,
+                local_npca_gallery=getattr(self, "local_npca_gallery", {}) or {},
+                on_local_npca_clicked=self._on_local_npca_clicked,
+                block_confidence=self.block_confidence,
+                block_uncertainty=self.block_uncertainty,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            self.status_label.setText(
+                f"Could not open Class Summary: {type(exc).__name__}: {exc}"
+            )
+            QMessageBox.warning(
+                self, "Class Summary failed to open",
+                f"{type(exc).__name__}: {exc}\n\n"
+                "The full traceback was printed to the terminal.",
+            )
+            return
 
-        dialog = ClassSummaryDialog(
-            self.classes_scheme,
-            self.session,
-            npca_gallery=self.npca_gallery,
-            block_confidence=self.block_confidence,
-            block_uncertainty=self.block_uncertainty,
-            parent=self,
+        view.thumbnail_clicked.connect(self._on_npca_thumbnail_clicked)
+        view.close_requested.connect(self._close_class_summary)
+        # Take the canvas's width demands so the splitter keeps the user's column
+        # widths across the swap; the view's own content scrolls inside it.
+        view.setSizePolicy(self.canvas.sizePolicy())
+        view.setMinimumWidth(self.canvas.minimumSizeHint().width())
+
+        # Swap the centre column: insert at the canvas's index, detach the canvas
+        # (kept alive on self.canvas), and restore the splitter's column widths.
+        index = self.main_layout.indexOf(self.canvas)
+        sizes = self.main_layout.sizes()
+        self.main_layout.insertWidget(index, view)
+        self.canvas.setParent(None)
+        self.main_layout.setSizes(sizes)
+        self._summary_page = view
+        self._showing_summary = True
+        self.status_label.setText(
+            f"Class Summary ({view.npca_source} Neural-PCA examples) "
+            "-- press Summary again or Esc to return to the map"
         )
-        dialog.thumbnail_clicked.connect(self._on_npca_thumbnail_clicked)
-        self._summary_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
+
+    def _close_class_summary(self) -> None:
+        """Put the panel canvas back in the centre column."""
+        if not self._showing_summary or self._summary_page is None:
+            return
+        index = self.main_layout.indexOf(self._summary_page)
+        sizes = self.main_layout.sizes()
+        self.main_layout.insertWidget(index, self.canvas)
+        self._summary_page.setParent(None)
+        self._summary_page.deleteLater()
+        self._summary_page = None
+        self.main_layout.setSizes(sizes)
+        self._showing_summary = False
+        # The canvas had no size while hidden, so re-apply the fit/zoom transform.
+        if self.session:
+            self.canvas.apply_zoom_view()
+        self.status_label.setText("Ready")
+
+    def _on_local_npca_clicked(self, block_id: str) -> None:
+        """Per-observation Neural-PCA thumbnail clicked: move the cursor to that block.
+
+        Unlike `_on_npca_thumbnail_clicked`, no image switch is involved -- these
+        exemplars were ranked over the blocks of the observation already open, so
+        this is ordinary in-image navigation.
+        """
+        if not self.session:
+            return
+        grid = self.session.grid
+        target = None
+        for index, block in enumerate(grid.iter_blocks()):
+            if block.block_id == block_id:
+                target = index
+                break
+        if target is None:
+            QMessageBox.information(
+                self, "Can't locate this block",
+                f"Block {block_id!r} is not part of the observation currently open.",
+            )
+            return
+
+        self._close_class_summary()  # so the jump is actually visible
+        self.session.move_to_block(target)
+        self.current_panel_idx = self.session.current_block().panel_idx
+        self._set_view("panel")
+        self._refresh_history()
+        block = grid.get_block(target)
+        self.status_label.setText(
+            f"Jumped to {block_id} (panel {block.panel_idx}, "
+            f"block {block.block_row},{block.block_col})"
+        )
 
     def _on_npca_thumbnail_clicked(self, source_id: str) -> None:
         """Neural-PCA gallery thumbnail (Class Summary window) clicked: jump
@@ -1156,6 +1431,13 @@ class MainWindow(QMainWindow):
         # Ignore input while the loading overlay is up (except letting Esc through)
         if self.loading_overlay is not None:
             super().keyPressEvent(event)
+            return
+
+        # Esc returns from the class summary to the map before anything else
+        # gets a chance at the key (Esc is also the overview's "go back").
+        if self._showing_summary:
+            if event.key() == Qt.Key.Key_Escape:
+                self._close_class_summary()
             return
 
         if not event.isAutoRepeat():

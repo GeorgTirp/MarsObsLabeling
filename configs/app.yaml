@@ -16,7 +16,13 @@ display:
   stretch_percentiles: [1, 99]
 
 skip:
-  nodata_skip_threshold: 0.5
+  # Auto-skip a block during labeling only when it is essentially ENTIRELY
+  # nodata (off-swath). A block that is merely mostly-nodata still has real
+  # terrain in it and is worth a human's judgement -- skipping those silently
+  # removes labelable ground. Distinct from inference.nodata_skip_threshold,
+  # which is stricter because a model prediction on a mostly-empty block is
+  # closer to noise.
+  nodata_skip_threshold: 0.99
   variance_skip_threshold: 0.0
   skip_low_variance: false
 

@@ -87,9 +87,52 @@ class PredictWorker(QThread):
         self.classes_scheme = classes_scheme
         self.inference_config = inference_config
         self._cancelled = False
+        # class_id -> component -> [LocalGalleryItem]; populated during run().
+        # Read by the dialog after finished_ok rather than sent through the
+        # signal, so the existing 3-dict finished_ok contract is untouched.
+        self.local_npca: dict = {}
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    def _build_local_npca(self, bundle, embedding_sink, raw_predictions: dict) -> dict:
+        """Rank this observation's blocks on the checkpoint's stored PCA bases.
+
+        Returns {} whenever it cannot be done -- a v1 `.npca.pt` with no bases,
+        no artifact at all, or a cancelled run -- since this is an optional
+        enrichment of the Summary window, never a reason to fail inference.
+        """
+        try:
+            from marslabeler.inference.local_npca import (
+                build_local_gallery,
+                classifier_weight_vectors,
+                stack_block_embeddings,
+            )
+            from marslabeler.inference.modelio import sidecar_path
+            from vision_backend.pc_align.neural_pca import load_gallery_bases
+
+            bases = load_gallery_bases(sidecar_path(self.checkpoint_path, "npca.pt"))
+            if not bases:
+                return {}
+
+            embeddings, aligned = stack_block_embeddings(embedding_sink, self.blocks)
+            if not len(aligned):
+                return {}
+
+            # Restrict each class's exemplars to blocks the model actually called
+            # that class; otherwise a component surfaces whichever block projects
+            # highest regardless of whether the class is present at all.
+            eligible: dict[int, set[str]] = {}
+            for block_id, model_index in raw_predictions.items():
+                eligible.setdefault(int(model_index), set()).add(block_id)
+
+            weights = classifier_weight_vectors(bundle.model, list(bases.keys()))
+            return build_local_gallery(
+                embeddings, aligned, bases, weights, eligible_block_ids=eligible
+            )
+        except Exception as exc:  # optional feature -- never break inference
+            self.status.emit(f"Local Neural-PCA unavailable: {exc}")
+            return {}
 
     def run(self) -> None:
         try:
@@ -102,7 +145,7 @@ class PredictWorker(QThread):
                 build_inference_plan,
                 load_model_bundle,
                 make_confidence_score_fn,
-                make_predict_fn,
+                make_predict_fn_with_embeddings,
             )
 
             bundle = load_model_bundle(
@@ -115,6 +158,7 @@ class PredictWorker(QThread):
                 block_size=self.block_size,
                 batch_size=self.inference_config.get("batch_size", 4),
                 context_multiplier=self.inference_config.get("context_multiplier", 4),
+                gsd_ratio=self.inference_config.get("gsd_ratio", 1.0),
             )
             model_index_to_id = self.classes_scheme.model_index_to_id()
 
@@ -137,14 +181,22 @@ class PredictWorker(QThread):
                 self.progress.emit(done, total)
                 self.status.emit(f"Predicting block {done}/{total}...")
 
+            # Capture each block's pooled feature phi(x) off the SAME forward pass
+            # that produces the predictions (measured cost: within noise). These
+            # feed the per-observation Neural-PCA gallery, so its thumbnails point
+            # at blocks of THIS image instead of the training corpus.
+            predict_fn, embedding_sink = make_predict_fn_with_embeddings(
+                bundle, quantization_bounds
+            )
             raw, raw_pixel_maps = run_block_inference_with_pixel_maps(
                 self.raster,
                 self.blocks,
                 plan,
-                make_predict_fn(bundle, quantization_bounds),
+                predict_fn,
                 progress_cb=progress_cb,
                 should_cancel=lambda: self._cancelled,
             )
+            self.local_npca = self._build_local_npca(bundle, embedding_sink, raw)
 
             if self._cancelled:
                 self.status.emit("Cancelled")
@@ -251,6 +303,8 @@ class PredictDialog(QDialog):
         self.predictions = predictions
         self.confidence = confidence
         self.pixel_predictions = pixel_predictions
+        # Built during the same pass; {} when the checkpoint has no PCA bases.
+        self.local_npca = getattr(self.worker, "local_npca", {}) or {}
         if predictions:
             self.accept()
         else:
@@ -266,6 +320,10 @@ class PredictDialog(QDialog):
 
     def get_confidence(self) -> dict[str, float]:
         return self.confidence
+
+    def get_local_npca(self) -> dict:
+        """class_id -> component -> ranked blocks of THIS observation ({} if unavailable)."""
+        return getattr(self, "local_npca", {})
 
     def get_pixel_predictions(self) -> dict[str, np.ndarray]:
         """block_id -> (h_px, w_px) uint8 per-pixel predicted class-id crop

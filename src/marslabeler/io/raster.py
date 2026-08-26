@@ -1,5 +1,6 @@
 """Raster reading: windowed and decimated reads via GDAL/rasterio."""
 
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -94,7 +95,8 @@ class RasterSource:
         return sorted(overviews)
 
     def read_window(
-        self, x: int, y: int, width: int, height: int, out_width: int, out_height: int
+        self, x: int, y: int, width: int, height: int, out_width: int, out_height: int,
+        resampling=None,
     ) -> np.ndarray:
         """
         Read a window from the raster with optional decimation via GDAL.
@@ -121,11 +123,20 @@ class RasterSource:
 
         # Use rasterio's windowed read with output size (GDAL decimation)
         window = rasterio.windows.Window(x_clamped, y_clamped, width_clamped, height_clamped)
-        data = self._dataset.read(1, window=window, out_shape=(out_height, out_width))
+        # Default (nearest) is right for decimation; UPsampling a window to match a
+        # model's training GSD needs an interpolating kernel, or the model sees
+        # blocky replicated pixels rather than smooth terrain.
+        if resampling is None and (out_width > width_clamped or out_height > height_clamped):
+            resampling = rasterio.enums.Resampling.bilinear
+        read_kwargs = {"window": window, "out_shape": (out_height, out_width)}
+        if resampling is not None:
+            read_kwargs["resampling"] = resampling
+        data = self._dataset.read(1, **read_kwargs)
         return np.asarray(data, dtype=data.dtype)
 
     def read_window_padded(
-        self, x: int, y: int, width: int, height: int, out_width: int, out_height: int
+        self, x: int, y: int, width: int, height: int, out_width: int, out_height: int,
+        resampling=None,
     ) -> np.ndarray:
         """
         Like read_window, but the requested region may extend beyond the image.
@@ -157,10 +168,38 @@ class RasterSource:
         ow = max(1, min(out_width - ox0, int(round((ix1 - ix0) * sx))))
         oh = max(1, min(out_height - oy0, int(round((iy1 - iy0) * sy))))
 
-        data = self.read_window(ix0, iy0, ix1 - ix0, iy1 - iy0, ow, oh)
+        data = self.read_window(ix0, iy0, ix1 - ix0, iy1 - iy0, ow, oh, resampling=resampling)
         out = np.zeros((out_height, out_width), dtype=data.dtype)
         out[oy0:oy0 + oh, ox0:ox0 + ow] = data[:oh, :ow]
         return out
+
+    # Cap on the decimated validity mask, in pixels. 64M is ~64 MB as bool and
+    # leaves a 1.1-gigapixel HiRISE strip at roughly 1 mask pixel per 5x5 native.
+    MAX_MASK_PIXELS = 64_000_000
+
+    def validity_mask(self, max_pixels: int | None = None) -> tuple[np.ndarray, int]:
+        """One decimated bool mask of the whole raster: True where data is valid.
+
+        Returns ``(mask, decimation)``. Reading the image once at reduced scale and
+        slicing this is O(1) raster reads for any number of blocks, where asking
+        each block for its own nodata fraction is O(blocks) windowed decodes --
+        the difference between a second and several minutes on a JP2 whose block
+        grid is fine.
+
+        Decimation is chosen to respect ``max_pixels``; the mask is therefore a
+        coarse estimate, which is all a nodata/off-swath test needs.
+        """
+        if self._dataset is None:
+            raise RuntimeError("Raster not open")
+        budget = max_pixels or self.MAX_MASK_PIXELS
+        total = self.width * self.height
+        decimation = 1
+        if total > budget:
+            decimation = int(math.ceil(math.sqrt(total / float(budget))))
+        out_h = max(1, self.height // decimation)
+        out_w = max(1, self.width // decimation)
+        data = self._dataset.read(1, out_shape=(out_h, out_w))
+        return ~compute_invalid_mask(data), decimation
 
     def nodata_fraction(self, x: int, y: int, width: int, height: int) -> float:
         """

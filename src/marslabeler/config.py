@@ -83,6 +83,17 @@ class InferenceConfig:
     # majority-nodata block is still meaningfully labelable by a human, but a model
     # prediction on one is closer to noise, so this defaults stricter.
     nodata_skip_threshold: float = 0.33
+    # Ground sample distance (m/px) the loaded observation is expected to have.
+    # NOAH-H is a 0.25 m/px product and the AI4ExoMars models are trained on it,
+    # so running on coarser/finer imagery is a scale domain shift: terrain
+    # features occupy a different number of pixels than the model ever saw.
+    # Used only when the checkpoint's own training imagery can't be resolved --
+    # otherwise the real training GSD is read from that and takes precedence.
+    expected_gsd_m: float = 0.25
+    # Warn when |log2(obs_gsd / train_gsd)| exceeds this, i.e. a scale ratio
+    # beyond 2**tolerance. 0.2 ~= +/-15%, which comfortably admits the 0.2414
+    # vs 0.2513 spread between NOAH-H's own products.
+    gsd_log2_tolerance: float = 0.2
 
 
 @dataclass

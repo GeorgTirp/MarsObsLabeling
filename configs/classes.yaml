@@ -4,6 +4,10 @@
 # model_index (optional, mars-inference only): the channel index this class
 # corresponds to in a model's output logits, if different from `id`.
 #
+# Names follow the NOAH-H published legend's "<Group>: <Subtype>" form
+# (legend numbers 1..14 = ids 0..13 here), which makes the DC->IG rollup
+# readable at a glance: the group prefix IS the interpretive group.
+#
 # This is the NOAH-H "DC" (surface-texture) legend that
 # checkpoints/stage3_segmentation_best.pt was trained on (see
 # AI4ExoMars/data/2022-02-08_ABarrett_OU_HiRISE_NOAH-H_Mosaic/derived/classes_DC.json).
@@ -23,20 +27,20 @@
 # rule because identity here is never color-alone: the legend always shows
 # the class name in text next to its swatch.
 classes:
-  - { id: 0,  name: "Smooth + Featureless",                                 color: "#d25cb2", hotkey: "q" }
-  - { id: 1,  name: "Smooth + Lineated",                                    color: "#007a3d", hotkey: "w" }
-  - { id: 2,  name: "Textured non-bedrock",                                 color: "#0087c2", hotkey: "e" }
-  - { id: 3,  name: "Smooth bedrock",                                       color: "#e55d4f", hotkey: "r" }
-  - { id: 4,  name: "Textured bedrock",                                     color: "#ab2b53", hotkey: "t" }
-  - { id: 5,  name: "Rugged bedrock",                                       color: "#4e71d7", hotkey: "y" }
-  - { id: 6,  name: "Fractured bedrock",                                    color: "#00a9a7", hotkey: "u" }
-  - { id: 7,  name: "Continuous + Simple form large ripples",               color: "#0074aa", hotkey: "i" }
-  - { id: 8,  name: "Isolated + Simple form large ripples",                 color: "#239036", hotkey: "o" }
-  - { id: 9,  name: "Rectilinear form large ripples",                       color: "#b769d5", hotkey: "p" }
-  - { id: 10, name: "Continuous small ripples",                             color: "#8b7b00", hotkey: "a" }
-  - { id: 11, name: "Bedrock substrate + Non-continuous small ripples",     color: "#0066c2", hotkey: "s" }
-  - { id: 12, name: "Non-bedrock substrate + Non-continuous small ripples", color: "#536f00", hotkey: "d" }
-  - { id: 13, name: "Boulder fields",                                      color: "#a29200", hotkey: "f" }
+  - { id: 0,  name: "Non-bedrock: Smooth",                         color: "#d25cb2", hotkey: "q" }
+  - { id: 1,  name: "Non-bedrock: Lineated",                       color: "#007a3d", hotkey: "w" }
+  - { id: 2,  name: "Non-bedrock: Textured",                       color: "#0087c2", hotkey: "e" }
+  - { id: 3,  name: "Bedrock: Smooth",                             color: "#e55d4f", hotkey: "r" }
+  - { id: 4,  name: "Bedrock: Textured",                           color: "#ab2b53", hotkey: "t" }
+  - { id: 5,  name: "Bedrock: Rugged",                             color: "#4e71d7", hotkey: "y" }
+  - { id: 6,  name: "Bedrock: Fractured",                          color: "#00a9a7", hotkey: "u" }
+  - { id: 7,  name: "Large Ripples: Continuous",                   color: "#0074aa", hotkey: "i" }
+  - { id: 8,  name: "Large Ripples: Isolated",                     color: "#239036", hotkey: "o" }
+  - { id: 9,  name: "Large Ripples: Rectilinear",                  color: "#b769d5", hotkey: "p" }
+  - { id: 10, name: "Small Ripples: Continuous",                   color: "#8b7b00", hotkey: "a" }
+  - { id: 11, name: "Small Ripples: Discontinuous, Bedrock",       color: "#0066c2", hotkey: "s" }
+  - { id: 12, name: "Small Ripples: Discontinuous, Non-Bedrock",   color: "#536f00", hotkey: "d" }
+  - { id: 13, name: "Boulder Fields",                              color: "#a29200", hotkey: "f" }
 
 # Reserved, not user-assignable via class hotkeys:
 abstain:

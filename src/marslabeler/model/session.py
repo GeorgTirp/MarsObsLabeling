@@ -134,14 +134,28 @@ class Session:
         self.current_block_idx = idx
 
     def _should_skip_block(self, block: BlockInfo) -> bool:
-        """Check if a block should be auto-skipped based on nodata/variance."""
+        """Check if a block should be auto-skipped based on nodata/variance.
+
+        Reuses the preprocessing pass's per-block nodata fractions when the caller
+        supplied them (`session.skip_decisions`). This runs on every cursor move
+        while hunting for the next unlabeled block, so decoding a window per block
+        here makes navigation stutter on a large observation.
+        """
         skip_config = self.config.get("skip", {})
         nodata_threshold = skip_config.get("nodata_skip_threshold", 0.5)
         variance_threshold = skip_config.get("variance_skip_threshold", 0.0)
         skip_low_var = skip_config.get("skip_low_variance", False)
 
         # Check nodata
-        nodata_frac = self.raster.nodata_fraction(block.x_px, block.y_px, block.w_px, block.h_px)
+        precomputed = getattr(self, "skip_decisions", None) or {}
+        cached = precomputed.get(block.block_id, {}).get("nodata_fraction")
+        nodata_frac = (
+            cached
+            if cached is not None
+            else self.raster.nodata_fraction(
+                block.x_px, block.y_px, block.w_px, block.h_px
+            )
+        )
         if nodata_frac > nodata_threshold:
             # Mark as nodata if it wasn't already
             record = self.labels.get_record(block.block_id)

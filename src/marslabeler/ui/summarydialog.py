@@ -17,10 +17,14 @@ Opened from the Legend panel's Summary button. For each configured class, shows:
 
 from __future__ import annotations
 
+import sys
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
+    QPushButton,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -36,6 +40,30 @@ from marslabeler.ui.render import numpy_to_qimage
 
 NPCA_COMPONENTS_SHOWN = 4
 NPCA_THUMBNAILS_PER_COMPONENT = 3
+# Thumbnails for the per-observation gallery are read from the open raster on
+# demand (the offline artifact's are baked in at fit time).
+LOCAL_THUMBNAIL_PX = 96
+
+
+class ClickableBlockThumbnail(QLabel):
+    """A per-observation thumbnail that emits its `block_id` when clicked.
+
+    Separate from ClickableThumbnail because the payloads address different
+    things: a training-corpus `source_id` names a pixel in another raster, while
+    a `block_id` names a block of the observation already open.
+    """
+
+    clicked = Signal(str)  # block_id
+
+    def __init__(self, block_id: str, parent=None):
+        super().__init__(parent)
+        self._block_id = block_id
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._block_id)
+        super().mousePressEvent(event)
 
 
 class ClickableThumbnail(QLabel):
@@ -57,13 +85,15 @@ class ClickableThumbnail(QLabel):
         super().mousePressEvent(event)
 
 
-class ClassSummaryDialog(QDialog):
-    """Per-class summary window. Shown non-modally (MainWindow.show()s it,
+class ClassSummaryView(QWidget):
+    """Per-class summary panel. Shown non-modally (MainWindow.show()s it,
     doesn't exec() it) so a Neural-PCA thumbnail click can navigate
     MainWindow to that block's location while this window stays open and
     visible alongside it."""
 
     thumbnail_clicked = Signal(str)  # source_id, forwarded from whichever ClickableThumbnail was clicked
+    local_block_clicked = Signal(str)  # block_id, from the per-observation gallery
+    close_requested = Signal()       # 'Back to map' pressed
 
     def __init__(
         self,
@@ -72,6 +102,8 @@ class ClassSummaryDialog(QDialog):
         npca_gallery: dict | None = None,
         block_confidence: dict[str, float] | None = None,
         block_uncertainty: dict[str, float] | None = None,
+        local_npca_gallery: dict | None = None,
+        on_local_npca_clicked=None,
         parent=None,
     ):
         super().__init__(parent)
@@ -80,27 +112,77 @@ class ClassSummaryDialog(QDialog):
         self.npca_gallery = npca_gallery or {}
         self.block_confidence = block_confidence or {}
         self.block_uncertainty = block_uncertainty or {}
-
-        self.setWindowTitle("Class Summary")
-        self.resize(900, 700)
+        self.local_npca_gallery = local_npca_gallery or {}
+        if on_local_npca_clicked is not None:
+            self.local_block_clicked.connect(on_local_npca_clicked)
+        # Prefer this observation's own top-activating blocks when we have them:
+        # clicking one navigates the image being labeled, whereas a training-corpus
+        # thumbnail points into a different raster entirely.
+        self.npca_source = "local" if self.local_npca_gallery else "training"
 
         outer = QVBoxLayout()
         self.setLayout(outer)
 
+        # --- Header: title + return to the map ---
+        header_row = QHBoxLayout()
+        title = QLabel("Class Summary")
+        title.setStyleSheet("font-weight: bold; font-size: 15px; color: #ffffff;")
+        header_row.addWidget(title)
+        header_row.addStretch()
+        self.back_button = QPushButton("\u2190 Back to map")
+        self.back_button.clicked.connect(self.close_requested)
+        header_row.addWidget(self.back_button)
+        outer.addLayout(header_row)
+
+        # --- Gallery source selector (only meaningful when both exist) ---
+        selector_row = QHBoxLayout()
+        selector_label = QLabel("Neural-PCA examples from:")
+        selector_label.setStyleSheet("color: #ccc; font-size: 11px;")
+        selector_row.addWidget(selector_label)
+        self.source_combo = QComboBox()
+        self.source_combo.addItem("This observation", "local")
+        self.source_combo.addItem("Training corpus", "training")
+        self.source_combo.setCurrentIndex(0 if self.npca_source == "local" else 1)
+        self.source_combo.setEnabled(bool(self.local_npca_gallery and self.npca_gallery))
+        if not self.local_npca_gallery:
+            self.source_combo.setToolTip(
+                "Run inference on this observation to rank its own blocks."
+            )
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        selector_row.addWidget(self.source_combo)
+        selector_row.addStretch()
+        outer.addLayout(selector_row)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        # Content wider than the column scrolls rather than forcing the
+        # splitter to widen this pane.
+        scroll.setMinimumWidth(0)
         outer.addWidget(scroll)
 
         container = QWidget()
-        container_layout = QVBoxLayout()
-        container_layout.setSpacing(12)
-        container.setLayout(container_layout)
+        self._container_layout = QVBoxLayout()
+        self._container_layout.setSpacing(12)
+        container.setLayout(self._container_layout)
         scroll.setWidget(container)
 
-        classes = sorted(classes_scheme.classes.values(), key=lambda c: c.id)
+        self._rebuild_sections()
+
+    def _on_source_changed(self, index: int) -> None:
+        self.npca_source = self.source_combo.itemData(index) or "training"
+        self._rebuild_sections()
+
+    def _rebuild_sections(self) -> None:
+        layout = self._container_layout
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        classes = sorted(self.classes_scheme.classes.values(), key=lambda c: c.id)
         for cls in classes:
-            container_layout.addWidget(self._build_class_section(cls))
-        container_layout.addStretch()
+            layout.addWidget(self._build_class_section(cls))
+        layout.addStretch()
 
     # ------------------------------------------------------------------ #
     # Per-class stats (always computable: pure LabelStore query)
@@ -168,6 +250,57 @@ class ClassSummaryDialog(QDialog):
 
         return frame
 
+    def _corpus_thumbnail(self, item):
+        """Thumbnail baked into the offline artifact at fit time."""
+        thumb = ClickableThumbnail(item.source_id)
+        thumb.setPixmap(QPixmap.fromImage(numpy_to_qimage(item.thumbnail)))
+        thumb.setToolTip(
+            f"rank {item.rank}, score={item.score:.3f}\n{item.source_id}\n"
+            "From the model's training corpus -- click to jump to this location\n"
+            "in that image (opens it if a different one is loaded)"
+        )
+        thumb.clicked.connect(self.thumbnail_clicked)
+        return thumb
+
+    def _local_thumbnail(self, item):
+        """Thumbnail read on demand from the observation currently open.
+
+        Returns None if the window can't be read (edge/nodata block), so one bad
+        crop degrades to a missing tile rather than an empty gallery.
+        """
+        from marslabeler.ui.render import apply_display_stretch
+
+        try:
+            data = self.session.raster.read_window(
+                item.x_px, item.y_px, item.w_px, item.h_px,
+                LOCAL_THUMBNAIL_PX, LOCAL_THUMBNAIL_PX,
+            )
+            if data.size == 0:
+                return None
+            stretched = apply_display_stretch(data, (1, 99))
+        except Exception as exc:
+            # One unreadable window shouldn't blank the whole gallery, but it must
+            # not vanish silently either -- a systematic failure here would look
+            # exactly like "the gallery stopped working".
+            print(
+                f"[summary] local thumbnail failed for {item.block_id} "
+                f"@({item.x_px},{item.y_px}) {item.w_px}x{item.h_px}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+        thumb = ClickableBlockThumbnail(item.block_id)
+        thumb.setPixmap(QPixmap.fromImage(numpy_to_qimage(stretched)))
+        thumb.setToolTip(
+            f"rank {item.rank}, score={item.score:.3f}\n"
+            f"{item.block_id} -- panel {item.panel_idx}, "
+            f"block {item.block_row},{item.block_col}\n"
+            "In this observation -- click to jump there"
+        )
+        thumb.clicked.connect(self.local_block_clicked)
+        return thumb
+
     def _build_npca_row(self, cls) -> QWidget:
         row = QWidget()
         grid = QGridLayout()
@@ -175,13 +308,26 @@ class ClassSummaryDialog(QDialog):
         row.setLayout(grid)
 
         model_index = self._model_index_for_class(cls)
-        class_gallery = self.npca_gallery.get(model_index)
+        local = self.npca_source == "local"
+        class_gallery = (
+            self.local_npca_gallery.get(model_index)
+            if local
+            else self.npca_gallery.get(model_index)
+        )
 
         if not class_gallery:
-            placeholder = QLabel(
-                "Neural PCA gallery not available yet -- needs a trained model + a "
-                "calibration pass (AI4ExoMars/vision_backend/pc_align/fit_neural_pca.py)."
-            )
+            if local:
+                text = (
+                    "No blocks of this observation were predicted as this class, so "
+                    "it has no local top-activating examples. Switch to \"Training "
+                    "corpus\" to see what the model learned for it."
+                )
+            else:
+                text = (
+                    "Neural PCA gallery not available yet -- needs a trained model + a "
+                    "calibration pass (AI4ExoMars/vision_backend/pc_align/fit_neural_pca.py)."
+                )
+            placeholder = QLabel(text)
             placeholder.setStyleSheet("color: #888; font-style: italic; font-size: 11px;")
             placeholder.setWordWrap(True)
             grid.addWidget(placeholder, 0, 0)
@@ -204,15 +350,11 @@ class ClassSummaryDialog(QDialog):
                 missing.setStyleSheet("color: #666; font-size: 10px;")
                 thumbnails_row.addWidget(missing)
             for item in items[:NPCA_THUMBNAILS_PER_COMPONENT]:
-                thumb_label = ClickableThumbnail(item.source_id)
-                qimage = numpy_to_qimage(item.thumbnail)
-                thumb_label.setPixmap(QPixmap.fromImage(qimage))
-                thumb_label.setToolTip(
-                    f"rank {item.rank}, score={item.score:.3f}\n{item.source_id}\n"
-                    "Click to jump to this location"
+                widget = (
+                    self._local_thumbnail(item) if local else self._corpus_thumbnail(item)
                 )
-                thumb_label.clicked.connect(self.thumbnail_clicked)
-                thumbnails_row.addWidget(thumb_label)
+                if widget is not None:
+                    thumbnails_row.addWidget(widget)
             col_layout.addLayout(thumbnails_row)
 
             grid.addWidget(col_widget, 0, component_idx)
@@ -239,3 +381,63 @@ class ClassSummaryDialog(QDialog):
         label.setStyleSheet("color: #cccccc; font-size: 11px; padding-top: 4px;")
         label.setWordWrap(True)
         return label
+
+
+class ClassSummaryDialog(QDialog):
+    """Free-floating window wrapper around :class:`ClassSummaryView`.
+
+    MainWindow shows the summary in-window (as a page of its centre stack)
+    because on macOS a non-modal child of a fullscreen/maximised window opens on
+    another Space and never becomes visible. This wrapper is kept for callers
+    that genuinely want a separate window, and forwards the view's signals and
+    the handful of attributes callers introspect.
+    """
+
+    thumbnail_clicked = Signal(str)
+    local_block_clicked = Signal(str)
+
+    def __init__(
+        self,
+        classes_scheme: ClassScheme,
+        session: Session,
+        npca_gallery: dict | None = None,
+        block_confidence: dict[str, float] | None = None,
+        block_uncertainty: dict[str, float] | None = None,
+        local_npca_gallery: dict | None = None,
+        on_local_npca_clicked=None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.view = ClassSummaryView(
+            classes_scheme,
+            session,
+            npca_gallery=npca_gallery,
+            block_confidence=block_confidence,
+            block_uncertainty=block_uncertainty,
+            local_npca_gallery=local_npca_gallery,
+            on_local_npca_clicked=on_local_npca_clicked,
+        )
+        self.view.back_button.setVisible(False)  # a window closes by its own chrome
+        self.view.thumbnail_clicked.connect(self.thumbnail_clicked)
+        self.view.local_block_clicked.connect(self.local_block_clicked)
+        self.view.close_requested.connect(self.close)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.view)
+        self.setLayout(layout)
+        self.setWindowTitle("Class Summary")
+        self.resize(900, 700)
+
+    def __getattr__(self, name: str):
+        """Delegate anything not found on the dialog to the wrapped view.
+
+        Keeps the pre-split surface (`npca_source`, `source_combo`, `_coverage`,
+        `_mean_score`, `_model_index_for_class`, ...) reachable on the dialog.
+        Only called for genuine misses, so it never shadows QDialog's own API.
+        """
+        try:
+            view = object.__getattribute__(self, "view")
+        except AttributeError:  # during __init__, before self.view exists
+            raise AttributeError(name) from None
+        return getattr(view, name)

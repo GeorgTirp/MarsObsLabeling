@@ -50,6 +50,35 @@ def main():
         ),
     )
     parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help=(
+            "Ignore any cached predictions for this observation and re-run "
+            "inference. Needed to (a) restore the pixel-wise view, per-block "
+            "confidence and this observation's Neural-PCA gallery -- all rebuilt "
+            "by the inference pass and not stored in the cache -- and (b) apply a "
+            "--resolution that differs from the saved session's tile size, which "
+            "is otherwise adopted so existing labels stay aligned."
+        ),
+    )
+    parser.add_argument(
+        "--match-training-gsd",
+        dest="match_training_gsd", action="store_true", default=None,
+        help=(
+            "Resample each window so a model pixel spans the ground distance the "
+            "model was trained on. Corrects the scale domain shift when the "
+            "observation's GSD differs from the training imagery's (measured on "
+            "labelled NOAH-H ground at a 2.07x mismatch: about +40%% mIoU), at "
+            "roughly ratio^2 the inference time. Without this flag or "
+            "--no-match-training-gsd you are asked when a mismatch is detected."
+        ),
+    )
+    parser.add_argument(
+        "--no-match-training-gsd",
+        dest="match_training_gsd", action="store_false",
+        help="Run at the observation's native scale without asking.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version="%(prog)s 0.1.0",
@@ -81,7 +110,13 @@ def main():
         ]
         config_path = next((p for p in potential_paths if p.exists()), Path("configs/app.yaml"))
 
-    window = MainWindow(config_path, resolution_m=args.resolution, predictions_mode=True)
+    window = MainWindow(
+        config_path,
+        resolution_m=args.resolution,
+        predictions_mode=True,
+        ignore_cached_predictions=args.fresh,
+        match_training_gsd=args.match_training_gsd,
+    )
     if args.device:
         window.config.inference.device = args.device
     if args.ai4exomars_path:

@@ -164,3 +164,40 @@ def test_render_overview_predictions_uncertainty_layer_shows_per_panel_mean(wind
     for p in range(4):
         pr, pc = divmod(p, 2)
         assert values[pr, pc] == pytest.approx(p * 0.1)
+
+
+def test_forward_logits_is_a_tensor_for_an_ig_trained_checkpoint():
+    """A checkpoint trained with the Stage-3 IG aux head must still predict.
+
+    `LightweightSegmentationDecoder` exposes the auxiliary interpretive-group
+    logits behind an opt-in `return_ig=True`, so the default forward stays a bare
+    DC-logits tensor whether or not `head_ig` exists. This pins that: inference
+    calls the default form and immediately does `.argmax(dim=1)`, which a tuple
+    or dict would break.
+    """
+    import numpy as np
+
+    torch = pytest.importorskip("torch")  # only ships with the optional [infer] extra
+
+    from marslabeler.inference.modelio import ModelBundle, _forward_logits
+    from vision_backend.training.builders import build_simmim_segmentation_model
+
+    config = dict(
+        in_channels=1, global_base_grid=32, drop_path=0.0, num_classes=14,
+        decoder_channels=32, num_classes_ig=5, model_kind="simmim",
+    )
+    model = build_simmim_segmentation_model(dict(config)).eval()
+    assert model.decoder.head_ig is not None, "fixture must actually have the IG head"
+
+    bundle = ModelBundle(
+        model=model, model_kind="simmim", num_classes=14, required_stride=256,
+        needs_context=False, device=torch.device("cpu"),
+        checkpoint_path=Path("unused.pt"), raw_config={},
+    )
+    batch = np.zeros((1, 256, 256), dtype=np.uint8)
+    with torch.no_grad():
+        logits = _forward_logits(bundle, batch, None, None)
+
+    assert isinstance(logits, torch.Tensor)
+    assert logits.shape == (1, 14, 256, 256)  # DC classes, not the 5 IG groups
+    assert logits.argmax(dim=1).shape == (1, 256, 256)

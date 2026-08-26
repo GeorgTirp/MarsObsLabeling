@@ -93,6 +93,7 @@ class UncertaintyWorker(QThread):
                 block_size=self.block_size,
                 batch_size=self.inference_config.get("batch_size", 4),
                 context_multiplier=self.inference_config.get("context_multiplier", 4),
+                gsd_ratio=self.inference_config.get("gsd_ratio", 1.0),
             )
             quantization_bounds = None
             if self.raster.dtype != "uint8":

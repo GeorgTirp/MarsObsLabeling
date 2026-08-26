@@ -1,5 +1,6 @@
 """Label store: in-memory state + Parquet persistence with undo/redo."""
 
+import sys
 import hashlib
 import json
 import time
@@ -408,17 +409,75 @@ class LabelStore:
 
     @classmethod
     def load_parquet(cls, path: Path, grid: Grid, labeler: str = "unknown") -> "LabelStore":
-        """Load labels from Parquet file."""
+        """Load labels from a Parquet file, keeping only records this grid owns.
+
+        Block ids are ``{obs_id}_{x_px}_{y_px}``, so a file written at a different
+        tile size shares ids wherever origins coincide -- every 512px origin is
+        also a 256px origin, for instance. Accepting those blindly would graft a
+        label that covered 4x the area onto a smaller block, which shows up as
+        predictions displaced against the imagery. A record is therefore accepted
+        only when its id exists in this grid AND its stored extent matches that
+        block's, so a geometry change drops the stale labels instead of
+        misplacing them.
+        """
         store = cls(grid, labeler)
         table = pq.read_table(str(path))
 
+        geometry = {
+            block.block_id: (block.x_px, block.y_px, block.w_px, block.h_px)
+            for block in grid.iter_blocks()
+        }
+
+        rejected_unknown = 0
+        rejected_geometry = 0
         for i in range(len(table)):
             row = table.slice(i, 1).to_pydict()
-            block_id = row["block_id"][0]
-            record = LabelRecord.from_dict({k: v[0] for k, v in row.items()})
-            store.records[block_id] = record
+            data = {k: v[0] for k, v in row.items()}
+            block_id = data["block_id"]
 
+            expected = geometry.get(block_id)
+            if expected is None:
+                rejected_unknown += 1
+                continue
+            stored = (data.get("x_px"), data.get("y_px"),
+                      data.get("w_px"), data.get("h_px"))
+            if any(v is not None for v in stored) and tuple(stored) != expected:
+                rejected_geometry += 1
+                continue
+
+            store.records[block_id] = LabelRecord.from_dict(data)
+
+        skipped = rejected_unknown + rejected_geometry
+        if skipped:
+            print(
+                f"[labelstore] {path.name}: dropped {skipped} of {len(table)} saved "
+                f"records that do not belong to this grid "
+                f"({rejected_unknown} unknown block id, {rejected_geometry} "
+                f"different extent) -- the file was written at a different tile "
+                f"size, so those labels would have landed on the wrong blocks.",
+                file=sys.stderr,
+            )
         return store
+
+    def refresh_class_names(self, id_to_name: dict[int, str]) -> int:
+        """Re-derive each record's `class_name` from the current class scheme.
+
+        `class_id` is authoritative; `class_name` is denormalized display metadata
+        written into the parquet at save time. Renaming a class in classes.yaml
+        therefore leaves previously saved sessions carrying the OLD name, which
+        then shows up in exports and per-block detail while the legend shows the
+        new one. Called after loading so the two cannot drift.
+
+        Returns the number of records updated. Reserved ids (abstain/nodata) and
+        ids absent from the scheme are left alone.
+        """
+        updated = 0
+        for record in self.records.values():
+            expected = id_to_name.get(record.class_id)
+            if expected is not None and record.class_name != expected:
+                record.class_name = expected
+                updated += 1
+        return updated
 
     def count_labeled(self) -> int:
         """Count labeled blocks (not unlabeled, abstain, or nodata)."""
