@@ -85,6 +85,18 @@ class KeyboardController:
 
         return False
 
+    def label_class(self, class_id: int) -> bool:
+        """Apply `class_id` to the current block, as if its hotkey were pressed.
+
+        The public entry point for non-keyboard callers (the legend panel's
+        click-to-label). Routes through the same handlers as a key press, so
+        undo history, auto-advance and the panel-change callback behave
+        identically however the class was chosen.
+        """
+        if class_id == self.classes_scheme.abstain.id:
+            return self._handle_abstain()
+        return self._handle_label_class(class_id)
+
     def _handle_label_class(self, class_id: int) -> bool:
         """Label current block with class and auto-advance."""
         block = self.session.current_block()

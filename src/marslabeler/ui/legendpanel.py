@@ -8,7 +8,7 @@ readable at a glance instead of being squeezed into a short scroll box.
 
 from typing import Callable, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QWidget,
@@ -51,6 +51,28 @@ def contrast_text_color(hex_color: str) -> str:
     return "#000000" if contrast_with_black >= contrast_with_white else "#ffffff"
 
 
+class ClassRow(QFrame):
+    """One legend entry, clickable to assign that class to the current block.
+
+    Labelling was keyboard-only, which forced a new user to memorise 18 hotkeys
+    before they could label anything. Clicking a row now does exactly what its
+    hotkey does -- the click is routed through the same controller entry point,
+    so undo, auto-advance and panel-change behave identically either way.
+    """
+
+    clicked = Signal(int)  # class id
+
+    def __init__(self, class_id: int, parent=None):
+        super().__init__(parent)
+        self._class_id = class_id
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._class_id)
+        super().mousePressEvent(event)
+
+
 class LegendPanel(QWidget):
     """Displays terrain classes as color blocks labeled with name + hotkey."""
 
@@ -65,6 +87,8 @@ class LegendPanel(QWidget):
         # Set by MainWindow after construction; opens the per-class Summary window
         # (coverage + confidence/uncertainty stats + neural-PCA gallery).
         self.on_summary_clicked: Optional[Callable[[], None]] = None
+        # Set by MainWindow; receives the class id of a clicked legend row.
+        self.on_class_clicked: Optional[Callable[[int], None]] = None
 
         layout = QVBoxLayout()
         layout.setContentsMargins(4, 4, 4, 4)
@@ -104,6 +128,10 @@ class LegendPanel(QWidget):
         if self.on_summary_clicked:
             self.on_summary_clicked()
 
+    def _emit_class_clicked(self, class_id: int) -> None:
+        if self.on_class_clicked:
+            self.on_class_clicked(class_id)
+
     def _create_class_row(self, class_obj) -> QWidget:
         """One class as a color block with its name written on it + hotkey badge."""
         text_color = contrast_text_color(class_obj.color)
@@ -112,12 +140,18 @@ class LegendPanel(QWidget):
         keycap_fill = "rgba(255, 255, 255, 0.25)" if text_color == "#ffffff" else "rgba(0, 0, 0, 0.16)"
         keycap_edge = "rgba(255, 255, 255, 0.65)" if text_color == "#ffffff" else "rgba(0, 0, 0, 0.45)"
 
-        frame = QFrame()
+        frame = ClassRow(class_obj.id)
+        frame.clicked.connect(self._emit_class_clicked)
         frame.setMinimumHeight(CLASS_ROW_MIN_HEIGHT)
         frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         frame.setStyleSheet(
             f"QFrame {{ background-color: {class_obj.color}; "
             "border: 1px solid rgba(0, 0, 0, 0.35); border-radius: 4px; }"
+            f"QFrame:hover {{ border: 2px solid {text_color}; }}"
+        )
+        frame.setToolTip(
+            f"Click to assign '{class_obj.name}'"
+            + (f" (or press {class_obj.hotkey})" if class_obj.hotkey else "")
         )
 
         row = QHBoxLayout()
@@ -127,6 +161,9 @@ class LegendPanel(QWidget):
 
         name = QLabel(class_obj.name)
         name.setWordWrap(True)
+        # Children must not eat the click, or only the row's padding would be
+        # clickable -- which reads as "clicking sometimes works".
+        name.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         name.setStyleSheet(
             f"color: {text_color}; font-size: 11px; font-weight: bold; "
             "background: transparent; border: none;"
@@ -142,7 +179,11 @@ class LegendPanel(QWidget):
                 "font-family: monospace; font-size: 11px; font-weight: bold; "
                 "padding: 2px 6px;"
             )
-            keycap.setToolTip(f"Press {class_obj.hotkey} to assign '{class_obj.name}'")
+            keycap.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            keycap.setToolTip(
+                f"Click this row, or press {class_obj.hotkey}, "
+                f"to assign '{class_obj.name}'"
+            )
             row.addWidget(keycap, 0, Qt.AlignmentFlag.AlignVCenter)
 
         return frame

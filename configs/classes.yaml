@@ -4,6 +4,17 @@
 # model_index (optional, mars-inference only): the channel index this class
 # corresponds to in a model's output logits, if different from `id`.
 #
+# HOTKEYS: 'o' is deliberately unused -- it is the app-level Overview toggle
+# (mainwindow.keyPressEvent), which is checked BEFORE class keys, so a class
+# bound to 'o' would be unreachable from the keyboard. Ids 0-13 keep their
+# original keys except id 8, which moved 'o' -> 'l' for that reason.
+#
+# MODEL CHANNELS: ids 14-17 are human-only classes. The stage-3 checkpoints
+# emit 14 channels (ids 0-13), so the model can never predict these; they
+# exist for manual labelling and for a future retrain on the wider legend.
+# model_index falls back to `id` for them (14-17), which is distinct and
+# simply never appears in a 14-channel argmax.
+#
 # Names follow the NOAH-H published legend's "<Group>: <Subtype>" form
 # (legend numbers 1..14 = ids 0..13 here), which makes the DC->IG rollup
 # readable at a glance: the group prefix IS the interpretive group.
@@ -18,7 +29,7 @@
 # Colors are NOT the NOAH-H legend's own hues (those repeat the same hue in 2-3
 # lightness steps per texture family -- fine for a static printed legend, but
 # adjacent steps of the same hue read as near-identical in this tool's overlay).
-# Generated instead as 14 colors in OKLCH, chosen (not eyeballed) so each
+# Generated instead in OKLCH, chosen (not eyeballed) so each
 # consecutive pair in this list clears the accessibility floors against this
 # app's actual dark canvas: worst adjacent CVD-simulated separation (protan/
 # deutan) 13.4 (target >=8, OKLab dE*100), worst adjacent normal-vision
@@ -26,21 +37,30 @@
 # contrast on the dark surface -- acceptable per the same method's contrast
 # rule because identity here is never color-alone: the legend always shows
 # the class name in text next to its swatch.
+#
+# The four appended colors (ids 14-17) were selected by the same method and
+# measured against it: adjacent-pair separation 16.4-47.0 normal / 14.1-49.6
+# CVD-simulated (floors 15 and 8), and WCAG contrast 2.68-10.12 against this
+# app's dark canvas -- at or above the dimmest existing color (2.65).
 classes:
-  - { id: 0,  name: "Non-bedrock: Smooth",                         color: "#d25cb2", hotkey: "q" }
-  - { id: 1,  name: "Non-bedrock: Lineated",                       color: "#007a3d", hotkey: "w" }
-  - { id: 2,  name: "Non-bedrock: Textured",                       color: "#0087c2", hotkey: "e" }
-  - { id: 3,  name: "Bedrock: Smooth",                             color: "#e55d4f", hotkey: "r" }
-  - { id: 4,  name: "Bedrock: Textured",                           color: "#ab2b53", hotkey: "t" }
-  - { id: 5,  name: "Bedrock: Rugged",                             color: "#4e71d7", hotkey: "y" }
-  - { id: 6,  name: "Bedrock: Fractured",                          color: "#00a9a7", hotkey: "u" }
-  - { id: 7,  name: "Large Ripples: Continuous",                   color: "#0074aa", hotkey: "i" }
-  - { id: 8,  name: "Large Ripples: Isolated",                     color: "#239036", hotkey: "o" }
-  - { id: 9,  name: "Large Ripples: Rectilinear",                  color: "#b769d5", hotkey: "p" }
-  - { id: 10, name: "Small Ripples: Continuous",                   color: "#8b7b00", hotkey: "a" }
-  - { id: 11, name: "Small Ripples: Discontinuous, Bedrock",       color: "#0066c2", hotkey: "s" }
-  - { id: 12, name: "Small Ripples: Discontinuous, Non-Bedrock",   color: "#536f00", hotkey: "d" }
-  - { id: 13, name: "Boulder Fields",                              color: "#a29200", hotkey: "f" }
+  - { id: 0,  name: "Non-bedrock: Smooth",                       color: "#d25cb2", hotkey: "q" }
+  - { id: 1,  name: "Non-bedrock: Lineated",                     color: "#007a3d", hotkey: "w" }
+  - { id: 2,  name: "Non-bedrock: Textured",                     color: "#0087c2", hotkey: "e" }
+  - { id: 3,  name: "Bedrock: Smooth",                           color: "#e55d4f", hotkey: "r" }
+  - { id: 4,  name: "Bedrock: Textured",                         color: "#ab2b53", hotkey: "t" }
+  - { id: 5,  name: "Bedrock: Rugged",                           color: "#4e71d7", hotkey: "y" }
+  - { id: 6,  name: "Bedrock: Fractured",                        color: "#00a9a7", hotkey: "u" }
+  - { id: 7,  name: "Large Ripples: Continuous",                 color: "#0074aa", hotkey: "i" }
+  - { id: 8,  name: "Large Ripples: Isolated",                   color: "#239036", hotkey: "l" }
+  - { id: 9,  name: "Large Ripples: Rectilinear",                color: "#b769d5", hotkey: "p" }
+  - { id: 10, name: "Small Ripples: Continuous",                 color: "#8b7b00", hotkey: "a" }
+  - { id: 11, name: "Small Ripples: Discontinuous, Bedrock",     color: "#0066c2", hotkey: "s" }
+  - { id: 12, name: "Small Ripples: Discontinuous, Non-Bedrock", color: "#536f00", hotkey: "d" }
+  - { id: 13, name: "Boulder Fields",                            color: "#a29200", hotkey: "f" }
+  - { id: 14, name: "Craters",                                   color: "#66dd00", hotkey: "g" }
+  - { id: 15, name: "Yardangs",                                  color: "#bbbbff", hotkey: "h" }
+  - { id: 16, name: "Dunes",                                     color: "#bbcc99", hotkey: "j" }
+  - { id: 17, name: "Periodic Bedrock Ridges",                   color: "#7700ff", hotkey: "k" }
 
 # Reserved, not user-assignable via class hotkeys:
 abstain:

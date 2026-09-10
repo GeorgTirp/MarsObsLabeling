@@ -936,6 +936,36 @@ class MainWindow(QMainWindow):
         self.block_uncertainty = dialog.get_scores()
         self.status_label.setText(f"Computed uncertainty for {len(self.block_uncertainty)} blocks")
 
+    def _on_legend_class_clicked(self, class_id: int) -> None:
+        """Legend row clicked: label the current block with that class.
+
+        Deliberately routed through the same controller entry point the hotkeys
+        use, so a click and a key press are the same operation as far as undo,
+        auto-advance and panel-change are concerned. Focus is returned to the
+        canvas afterwards so the keyboard keeps working without a manual click
+        back -- otherwise the legend would steal focus on first use and the
+        hotkeys would appear to stop responding.
+        """
+        if not self.session or not self.controller:
+            return
+        if self.view_mode == "overview":
+            self.status_label.setText(
+                "Overview is navigation-only -- open a panel to label."
+            )
+            return
+        if self._showing_summary:
+            return
+
+        # A marquee selection is an explicit "label THESE blocks" gesture, so a
+        # class click fills it rather than labelling only the cursor's block.
+        if self.selection_rect is not None:
+            self._fill_selection(class_id)
+            self.canvas.setFocus()
+            return
+
+        self.controller.label_class(class_id)
+        self.canvas.setFocus()
+
     def _show_class_summary(self) -> None:
         """Legend panel's Summary button: swap the centre view to the class summary.
 
@@ -1140,6 +1170,7 @@ class MainWindow(QMainWindow):
         """Swap the legend placeholder for the real legend (by reference)."""
         legend = LegendPanel(self.classes_scheme)
         legend.on_summary_clicked = self._show_class_summary
+        legend.on_class_clicked = self._on_legend_class_clicked
         # The legend is its own QSplitter column now, and QSplitter has no
         # replaceWidget() (that's QLayout-only) -- same insert-then-detach
         # pattern as _update_history_panel, and it must preserve the column's
