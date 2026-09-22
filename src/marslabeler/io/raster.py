@@ -1,6 +1,7 @@
 """Raster reading: windowed and decimated reads via GDAL/rasterio."""
 
 import math
+import hashlib
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,28 @@ class RasterSource:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self._dataset: Optional[rasterio.DatasetReader] = None
+        self._fingerprint_cache = None
+
+    def fingerprint(self) -> dict:
+        """Bind labels to the exact source file and its georeferencing.
+
+        Stream the file once per open source/version; subsequent autosaves reuse
+        the digest. A copied file is accepted, a replaced same-size image is not.
+        """
+        stat = self.path.stat()
+        version = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+        if self._fingerprint_cache is None or self._fingerprint_cache[0] != version:
+            with self.path.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            self._fingerprint_cache = (version, digest)
+        return {"sha256": self._fingerprint_cache[1], "width": self.width,
+                "height": self.height, "transform": list(self.transform),
+                "crs": self.crs.to_wkt() if self.crs else None}
+
+    def validate_fingerprint(self, expected: dict | None) -> None:
+        if expected is not None and expected != self.fingerprint():
+            raise ValueError("Saved labels belong to a different or modified source image. "
+                             "Open the original image or choose a separate labels folder.")
 
     def open(self) -> None:
         """Open the raster and read metadata."""

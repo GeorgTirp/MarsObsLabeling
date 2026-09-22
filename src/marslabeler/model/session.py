@@ -9,6 +9,7 @@ from typing import Literal, Optional
 from marslabeler.io.raster import RasterSource
 from marslabeler.model.grid import BlockInfo, Grid
 from marslabeler.model.labelstore import LabelStore
+from marslabeler.io.atomic import atomic_output
 
 
 class Session:
@@ -29,7 +30,12 @@ class Session:
         # Navigation state
         self.current_block_idx = 0
         self.last_label_time = 0
+        self.last_save_time = time.time()
         self.label_count_since_autosave = 0
+
+    def mark_changed(self, count: int = 1) -> None:
+        self.label_count_since_autosave += count
+        self.last_label_time = time.time()
 
     def current_block(self) -> BlockInfo:
         """Get the current block info."""
@@ -54,30 +60,31 @@ class Session:
     def label_current_block(self, class_id: int, class_name: str) -> None:
         """Label the current block and auto-advance."""
         block = self.current_block()
+        if block.w_px <= 0 or block.h_px <= 0:
+            self.labels.set_nodata_bulk([block.block_id])
+            self._auto_advance()
+            return
+        was_labeled = self.labels.get_record(block.block_id).status != "unlabeled"
         self.labels.assign(block.block_id, class_id, class_name)
-        self.label_count_since_autosave += 1
-        self.last_label_time = time.time()
-        self._auto_advance()
+        self.mark_changed()
+        if not was_labeled or self.config.get("navigation", {}).get("advance_on_edit", False):
+            self._auto_advance()
 
     def abstain_current_block(self) -> None:
         """Mark current block as abstain and auto-advance."""
-        block = self.current_block()
-        self.labels.assign(block.block_id, -1, "Abstain")
-        self.label_count_since_autosave += 1
-        self.last_label_time = time.time()
-        self._auto_advance()
+        self.label_current_block(-1, "Abstain")
 
     def clear_current_block(self) -> None:
         """Clear current block back to unlabeled."""
         block = self.current_block()
         self.labels.clear(block.block_id)
-        self.label_count_since_autosave += 1
+        self.mark_changed()
 
     def relabel_current_block(self, class_id: int, class_name: str) -> None:
         """Edit current block's label (no auto-advance on edit)."""
         block = self.current_block()
         self.labels.assign(block.block_id, class_id, class_name)
-        self.label_count_since_autosave += 1
+        self.mark_changed()
 
     def _auto_advance(self) -> None:
         """Auto-advance to next target block based on config."""
@@ -160,7 +167,7 @@ class Session:
             # Mark as nodata if it wasn't already
             record = self.labels.get_record(block.block_id)
             if record.status == "unlabeled":
-                self.labels.set_nodata(block.block_id)
+                self.labels.set_nodata_bulk([block.block_id])
             return True
 
         # Check variance
@@ -215,13 +222,14 @@ class Session:
         every_secs = save_config.get("every_seconds", 30)
 
         labels_threshold = self.label_count_since_autosave >= every_n
-        time_threshold = (time.time() - self.last_label_time) > every_secs
-        return labels_threshold or time_threshold
+        time_threshold = (time.time() - self.last_save_time) >= every_secs
+        return self.label_count_since_autosave > 0 and (labels_threshold or time_threshold)
 
     def reset_autosave_counter(self) -> None:
         """Reset autosave counters after saving."""
         self.label_count_since_autosave = 0
         self.last_label_time = time.time()
+        self.last_save_time = self.last_label_time
 
     def save_session(self, labels_dir: Path, extra_meta: Optional[dict] = None) -> None:
         """Save labels and session state.
@@ -232,14 +240,14 @@ class Session:
         labels_dir = Path(labels_dir)
         labels_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save labels to Parquet
-        parquet_path = labels_dir / f"{self.grid.obs_id}.parquet"
-        self.labels.save_parquet(parquet_path)
-
         # Save session JSON. img_width/img_height let a later run detect that the
         # saved labels belong to a different image (wrong-picture guard); panel_size/
         # block_size let it detect a different tile resolution.
-        session_data = {
+        self.raster.validate_fingerprint(self.labels.metadata.get("source"))
+        session_data = dict(self.labels.metadata)
+        if extra_meta:
+            session_data.update(extra_meta)
+        session_data.update({
             "obs_id": self.grid.obs_id,
             "current_block_idx": self.current_block_idx,
             "panel_size": self.grid.panel_size,
@@ -247,25 +255,32 @@ class Session:
             "img_width": self.grid.img_width,
             "img_height": self.grid.img_height,
             "timestamp": int(time.time() * 1000),
-        }
-        if extra_meta:
-            session_data.update(extra_meta)
+            "source": self.raster.fingerprint(),
+        })
+        # Parquet is the authoritative, atomic snapshot: cursor and provenance
+        # travel with labels even if writing the optional sidecar is interrupted.
+        self.labels.metadata = session_data
+        parquet_path = labels_dir / f"{self.grid.obs_id}.parquet"
+        self.labels.save_parquet(parquet_path)
         session_path = labels_dir / f"{self.grid.obs_id}.session.json"
-        with open(session_path, "w") as f:
-            json.dump(session_data, f, indent=2)
+        with atomic_output(session_path) as temporary:
+            temporary.write_text(json.dumps(session_data, indent=2))
+        self.reset_autosave_counter()
 
     @staticmethod
     def read_saved_metadata(labels_dir: Path, obs_id: str) -> Optional[dict]:
         """Return the stored session.json for obs_id if a resumable session exists.
 
-        A session is resumable only when BOTH the labels (.parquet) and the cursor
-        (.session.json) files are present. Returns None otherwise.
+        Prefer the atomic Parquet metadata; legacy files may use the JSON sidecar.
         """
         labels_dir = Path(labels_dir)
         parquet_path = labels_dir / f"{obs_id}.parquet"
         session_path = labels_dir / f"{obs_id}.session.json"
-        if not (parquet_path.exists() and session_path.exists()):
+        if not parquet_path.exists():
             return None
+        metadata = LabelStore.read_metadata(parquet_path)
+        if metadata:
+            return metadata
         try:
             with open(session_path) as f:
                 return json.load(f)
@@ -280,26 +295,32 @@ class Session:
         config: dict,
         labels_dir: Path,
         labeler: str = "unknown",
+        resume: bool = True,
     ) -> "Session":
         """Load session if it exists, otherwise create new."""
         labels_dir = Path(labels_dir)
         parquet_path = labels_dir / f"{grid.obs_id}.parquet"
-        session_path = labels_dir / f"{grid.obs_id}.session.json"
-
         raster = RasterSource(raster_path)
         raster.open()
 
-        if parquet_path.exists() and session_path.exists():
+        if resume and parquet_path.exists():
             # Load existing session
-            label_store = LabelStore.load_parquet(parquet_path, grid, labeler)
+            try:
+                session_data = cls.read_saved_metadata(labels_dir, grid.obs_id) or {}
+                raster.validate_fingerprint(session_data.get("source"))
+                for field in ("img_width", "img_height", "block_size"):
+                    if field in session_data and session_data[field] != getattr(grid, field):
+                        raise ValueError(f"Saved labels have different {field}; use the saved geometry.")
+                label_store = LabelStore.load_parquet(parquet_path, grid, labeler, strict=True)
+            except Exception:
+                raster.close()
+                raise
             session = cls(raster, grid, label_store, config)
 
             # Restore cursor position (clamp: a stale/mismatched index must not
             # leave current_block_idx pointing outside the grid)
-            with open(session_path) as f:
-                session_data = json.load(f)
             restored_idx = session_data.get("current_block_idx", 0)
-            if 0 <= restored_idx < grid.num_blocks():
+            if isinstance(restored_idx, int) and 0 <= restored_idx < grid.num_blocks():
                 session.current_block_idx = restored_idx
 
             return session

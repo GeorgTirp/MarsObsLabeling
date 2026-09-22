@@ -5,12 +5,10 @@ import json
 import sys
 from pathlib import Path
 
-import numpy as np
 import pyarrow.parquet as pq
 from PIL import Image
 
 from marslabeler.io.raster import RasterSource
-from marslabeler.model.grid import Grid
 from marslabeler.model.labelstore import LabelStore
 from marslabeler.classes import load_classes
 
@@ -32,100 +30,87 @@ def export_probe_set(
         output_dir: Output directory for crops
         min_confidence: Minimum confidence to include (not used in v1, reserved for future)
     """
+    import csv
+    import tempfile
+
     output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # A fresh directory prevents orphaned crops from earlier exports being
+    # mistaken for current labels by folder-based training loaders.
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise FileExistsError(f"Export directory is not empty: {output_dir}. Choose a new directory.")
 
-    # Load raster and metadata
-    raster = RasterSource(jp2_path)
-    raster.open()
-
-    # Load labels
-    table = pq.read_table(str(parquet_path))
-
-    # Load classes for metadata
+    table = pq.read_table(parquet_path)
+    metadata = LabelStore.read_metadata(parquet_path)
     classes_scheme = load_classes(classes_yaml)
+    rows = table.to_pylist()
+    required = {"block_id", "obs_id", "x_px", "y_px", "w_px", "h_px", "class_id", "status"}
+    if not required.issubset(table.column_names):
+        raise ValueError("Labels are missing required block coordinates or class columns")
 
-    # Get grid info from first block
-    first_row = table.slice(0, 1).to_pydict()
-    obs_id = first_row["obs_id"][0]
-    img_width = raster.width
-    img_height = raster.height
-    gsd = raster.gsd
+    with RasterSource(jp2_path) as raster:
+        raster.validate_fingerprint(metadata.get("source"))
+        for key, actual in (("img_width", raster.width), ("img_height", raster.height)):
+            if key in metadata and metadata[key] != actual:
+                raise ValueError(f"Source image {key} does not match saved labels")
+        if raster.dtype not in ("uint8", "uint16"):
+            raise ValueError(f"PNG crop export requires uint8 or uint16 imagery, got {raster.dtype}")
 
-    # Infer block size from first block's w_px
-    block_width = first_row["w_px"][0]
-    block_height = first_row["h_px"][0]
+        seen = set()
+        labeled = []
+        for row in rows:
+            bid = row["block_id"]
+            if bid in seen:
+                raise ValueError(f"Duplicate block id: {bid}")
+            seen.add(bid)
+            if row["obs_id"] != Path(jp2_path).stem:
+                raise ValueError(f"Label observation {row['obs_id']} does not match the source image")
+            x, y, w, h = (row[k] for k in ("x_px", "y_px", "w_px", "h_px"))
+            if not all(isinstance(v, int) for v in (x, y, w, h)):
+                raise ValueError(f"Invalid block coordinates: {bid}")
+            if bid != f"{row['obs_id']}_{x}_{y}":
+                raise ValueError(f"Block id and coordinates disagree: {bid}")
+            status, cid = row["status"], row["class_id"]
+            if status != "labeled":
+                if {"abstain": -1, "nodata": -2, "unlabeled": -3}.get(status) != cid:
+                    raise ValueError(f"Invalid class/status for block {bid}")
+                continue
+            if cid not in classes_scheme.classes:
+                raise ValueError(f"Unknown class id {cid} for block {bid}")
+            if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > raster.width or y + h > raster.height:
+                raise ValueError(f"Block extent is outside source image bounds: {bid}")
+            size = metadata.get("block_size")
+            if size and (x % size or y % size or w != min(size, raster.width - x)
+                         or h != min(size, raster.height - y)):
+                raise ValueError(f"Block extent does not match saved tile geometry: {bid}")
+            labeled.append(row)
 
-    # Get panel/block sizes (assume uniform)
-    panel_size = 4096  # Default
-    block_size = 512   # Default
-
-    grid = Grid(img_width, img_height, panel_size, block_size, obs_id, raster.transform, raster.crs)
-
-    # Export labeled blocks as crops
-    crops_dir = output_dir / "crops"
-    crops_dir.mkdir(exist_ok=True)
-
-    labels_csv_lines = ["block_id,x_px,y_px,class_id,class_name,confidence"]
-    crop_count = 0
-
-    for i in range(len(table)):
-        row = table.slice(i, 1).to_pydict()
-
-        block_id = row["block_id"][0]
-        x_px = row["x_px"][0]
-        y_px = row["y_px"][0]
-        w_px = row["w_px"][0]
-        h_px = row["h_px"][0]
-        class_id = row["class_id"][0]
-        class_name = row["class_name"][0]
-        status = row["status"][0]
-
-        # Skip unlabeled, abstain, and nodata
-        if status != "labeled":
-            continue
-
-        # Read native-resolution block
-        block_data = raster.read_window(x_px, y_px, w_px, h_px, w_px, h_px)
-
-        # Save as PNG
-        img = Image.fromarray(block_data, mode="L")
-        crop_filename = f"{block_id}.png"
-        crop_path = crops_dir / crop_filename
-        img.save(crop_path)
-
-        # Write CSV line (confidence=1.0 for v1 since all labeled blocks are included)
-        labels_csv_lines.append(
-            f"{block_id},{x_px},{y_px},{class_id},{class_name},1.0"
-        )
-
-        crop_count += 1
-
-    # Write CSV
-    csv_path = output_dir / "labels.csv"
-    with open(csv_path, "w") as f:
-        f.write("\n".join(labels_csv_lines) + "\n")
-
-    # Write class metadata
-    classes_list = []
-    for class_id, class_obj in sorted(classes_scheme.classes.items()):
-        classes_list.append({
-            "id": class_id,
-            "name": class_obj.name,
-            "color": class_obj.color,
-        })
-
-    meta_path = output_dir / "classes.json"
-    with open(meta_path, "w") as f:
-        json.dump({"classes": classes_list}, f, indent=2)
-
-    # Summary
-    print(f"Exported probe set to {output_dir}")
-    print(f"  Crops: {crop_count} PNG files")
-    print(f"  Labels: {csv_path}")
-    print(f"  Classes: {meta_path}")
-
-    raster.close()
+        # Publish a complete set only after every crop and both manifests succeed.
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".probe-", dir=output_dir.parent) as staging:
+            staged = Path(staging) / "export"
+            crops_dir = staged / "crops"
+            crops_dir.mkdir(parents=True)
+            fields = ["block_id", "x_px", "y_px", "class_id", "class_name", "confidence",
+                      "w_px", "h_px", "crop_filename", "dtype"]
+            with (staged / "labels.csv").open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                for row in labeled:
+                    x, y, w, h = (row[k] for k in ("x_px", "y_px", "w_px", "h_px"))
+                    data = raster.read_window(x, y, w, h, w, h)
+                    filename = row["block_id"] + ".png"
+                    # Let Pillow infer L or I;16: forcing L reinterprets uint16 bytes.
+                    Image.fromarray(data).save(crops_dir / filename)
+                    writer.writerow({"block_id": row["block_id"], "x_px": x, "y_px": y,
+                                     "w_px": w, "h_px": h, "class_id": row["class_id"],
+                                     "class_name": classes_scheme.get_name(row["class_id"]),
+                                     "confidence": 1.0, "crop_filename": filename,
+                                     "dtype": raster.dtype})
+            classes = [{"id": cid, "name": c.name, "color": c.color}
+                       for cid, c in sorted(classes_scheme.classes.items())]
+            (staged / "classes.json").write_text(json.dumps({"classes": classes}, indent=2))
+            staged.replace(output_dir)
+    print(f"Exported {len(labeled)} native-resolution crops to {output_dir}")
 
 
 def main():

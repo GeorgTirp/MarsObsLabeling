@@ -252,8 +252,8 @@ def test_invalid_key_not_handled(qapp, controller):
 
 def test_autorepeat_ignored(qapp, controller):
     """Test that autorepeat key events are ignored."""
-    event = QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_A, Qt.KeyboardModifier.NoModifier)
-    event.setAutoRepeat(True)
+    event = QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_A,
+                      Qt.KeyboardModifier.NoModifier, "a", True)
     result = controller.handle_key_press(event)
 
     assert result is False

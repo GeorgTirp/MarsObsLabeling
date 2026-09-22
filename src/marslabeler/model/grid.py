@@ -157,9 +157,7 @@ class Grid:
         """Transform block centroid to map (CRS) coords."""
         centroid_px = block.centroid_px()
         # Apply affine transform: map = transform * pixel
-        x_map = self.transform.c + centroid_px[0] * self.transform.a
-        y_map = self.transform.f + centroid_px[1] * self.transform.e
-        return (x_map, y_map)
+        return self.transform * centroid_px
 
     def num_blocks(self) -> int:
         """Total number of blocks."""

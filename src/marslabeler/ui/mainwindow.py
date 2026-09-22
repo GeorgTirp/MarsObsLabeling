@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QMessageBox,
 )
-from PySide6.QtGui import QAction, QKeyEvent
+from PySide6.QtGui import QAction, QKeyEvent, QKeySequence
 
 from marslabeler.io.raster import RasterSource
 from marslabeler.model.grid import Grid
@@ -281,6 +281,13 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self._on_open_file)
         file_menu.addAction(open_action)
 
+        self.save_action = QAction("Save Labels", self)
+        self.save_action.setShortcut(QKeySequence.StandardKey.Save)
+        self.save_action.triggered.connect(
+            lambda: self._save_predictions() if self.predictions_mode else self._autosave_session()
+        )
+        file_menu.addAction(self.save_action)
+
         self.labels_folder_action = QAction("Set Labels Folder...", self)
         self.labels_folder_action.triggered.connect(self._on_set_labels_folder)
         file_menu.addAction(self.labels_folder_action)
@@ -335,6 +342,10 @@ class MainWindow(QMainWindow):
 
     def _load_observation(self, jp2_path: Path):
         """Load a JP2 observation and create a session."""
+        previous_session = self.session
+        if previous_session and not self.predictions_mode:
+            if not self._autosave_session(note="before opening another observation"):
+                return
         if self.predictions_mode:
             # A new image invalidates any analysis layers computed for the previous
             # one (load_for_inference() repopulates block_confidence/npca_gallery
@@ -488,7 +499,10 @@ class MainWindow(QMainWindow):
                 self.config.to_dict(),
                 self.labels_dir,
                 labeler=self.config.labeler or "unknown",
+                resume=not (self.predictions_mode and self.ignore_cached_predictions),
             )
+            if previous_session:
+                previous_session.raster.close()
 
             # A restored session carries the class NAMES that were current when it
             # was saved; class_id is authoritative, so re-derive them rather than
@@ -517,14 +531,18 @@ class MainWindow(QMainWindow):
             preprocess_dialog = PreprocessDialog(raster, grid, self.config.to_dict())
             preprocess_dialog.start_preprocessing()
 
-            if preprocess_dialog.exec() != QDialog.DialogCode.Accepted:
+            result = preprocess_dialog.exec()
+            preprocess_dialog.worker.wait()
+            if result != QDialog.DialogCode.Accepted:
                 self.status_label.setText("Loading cancelled")
                 raster.close()
+                self.session.raster.close()
                 self.session = None
                 return
 
             # Store skip decisions for later use
             self.skip_decisions = preprocess_dialog.get_skip_decisions()
+            raster.close()
             # Share them so navigation doesn't re-decode a window per block.
             self.session.skip_decisions = self.skip_decisions
 
@@ -561,6 +579,11 @@ class MainWindow(QMainWindow):
             self.saved_complete_panels = set()
 
             self.status_label.setText(f"Loaded: {jp2_path.stem}")
+            # Only a real observation open schedules startup help. Rendering a
+            # panel (including hidden test/review windows) must not open modals.
+            if not self.help_shown_on_startup:
+                self.help_shown_on_startup = True
+                QTimer.singleShot(100, self._show_help)
 
         except Exception as e:
             # Surface the failure instead of silently leaving a blank "(No session)"
@@ -1251,11 +1274,6 @@ class MainWindow(QMainWindow):
             self.loading_overlay.deleteLater()
             self.loading_overlay = None
 
-        # Defer help dialog to next event loop iteration so the canvas paints first
-        if not self.help_shown_on_startup:
-            self.help_shown_on_startup = True
-            QTimer.singleShot(100, self._show_help)
-
     def _on_block_clicked(self, block_row: int, block_col: int):
         """Click handling depends on the active view mode."""
         if not self.session:
@@ -1399,7 +1417,7 @@ class MainWindow(QMainWindow):
         if self.held_class_id is None or not self.session or self.view_mode != "panel":
             return
         block = self._panel_block_map().get((block_row, block_col))
-        if block is None:
+        if block is None or block.w_px <= 0 or block.h_px <= 0:
             return
         # snapshot only on the first cell so the whole stroke is one undo step
         self.session.labels.assign(
@@ -1408,6 +1426,7 @@ class MainWindow(QMainWindow):
             self.classes_scheme.get_name(self.held_class_id),
             snapshot=is_start,
         )
+        self.session.mark_changed()
         self._refresh_label_overlay()
 
     def _on_block_paint_end(self) -> None:
@@ -1416,6 +1435,7 @@ class MainWindow(QMainWindow):
             return
         self._refresh_history()
         self._maybe_save_completed_panel(self.current_panel_idx)
+        self._maybe_autosave()
 
     def _on_selection_made(self, r0: int, c0: int, r1: int, c1: int) -> None:
         """A Shift+drag marquee was completed — remember it and await a class key."""
@@ -1444,17 +1464,19 @@ class MainWindow(QMainWindow):
             bmap[(r, c)].block_id
             for r in range(r0, r1 + 1)
             for c in range(c0, c1 + 1)
-            if (r, c) in bmap
+            if (r, c) in bmap and bmap[(r, c)].w_px > 0 and bmap[(r, c)].h_px > 0
         ]
         name = self.classes_scheme.get_name(class_id)
         if ids:
-            self.session.labels.bulk_assign(ids, class_id, name)
+            count = self.session.labels.bulk_assign(ids, class_id, name)
+            self.session.mark_changed(count)
         if class_id >= 0:
             self.last_class_id = class_id
         self._clear_selection()
         self._refresh_label_overlay()
         self._refresh_history()
         self._maybe_save_completed_panel(self.current_panel_idx)
+        self._maybe_autosave()
         self.status_label.setText(f"Filled {len(ids)} blocks with {name}")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
@@ -1536,6 +1558,7 @@ class MainWindow(QMainWindow):
         self._refresh_history()
         # If that panel is now fully done (e.g. last block labeled), autosave it
         self._maybe_save_completed_panel(prev_panel)
+        self._maybe_autosave()
 
     def _on_panel_changed_kb(self) -> None:
         """Callback: cursor rolled into another panel (auto-advance / PageUp). Just redraw."""
@@ -1555,6 +1578,10 @@ class MainWindow(QMainWindow):
             return
 
         current_block = self.session.current_block()
+        if current_block.panel_idx != self.current_panel_idx:
+            self._refresh_view()
+            self._refresh_history()
+            return
         self.canvas.set_current_block_highlight(current_block.block_row, current_block.block_col)
         # Keep the current block in view when zoomed in
         self.canvas.recenter_current()
@@ -1809,7 +1836,7 @@ class MainWindow(QMainWindow):
 
     def _maybe_autosave(self) -> None:
         """Check if autosave should trigger."""
-        if not self.session or not self.controller:
+        if self.predictions_mode or not self.session or not self.controller:
             return
 
         if self.controller.should_autosave():
@@ -1817,7 +1844,7 @@ class MainWindow(QMainWindow):
 
     def _do_autosave(self) -> None:
         """Perform autosave."""
-        if not self.session:
+        if self.predictions_mode or not self.session:
             return
 
         try:
@@ -1889,18 +1916,32 @@ class MainWindow(QMainWindow):
             # Panel reopened/edited below complete — allow it to save again later
             self.saved_complete_panels.discard(panel)
 
-    def _autosave_session(self, note: str = "") -> None:
+    def _autosave_session(self, note: str = "") -> bool:
         """Save the session parquet + cursor JSON."""
-        if not self.session:
-            return
+        if not self.session or self.predictions_mode:
+            return True
         try:
             self.session.save_session(self.labels_dir)
             if self.controller:
                 self.controller.reset_autosave()
             msg = "Saved" if not note else f"Saved ({note})"
             self.status_label.setText(msg)
+            return True
         except Exception as e:
             self.status_label.setText(f"Save error: {str(e)}")
+            return False
+
+    def closeEvent(self, event) -> None:
+        """Persist the last edits/cursor before releasing the observation."""
+        if not self._autosave_session(note="on close"):
+            QMessageBox.critical(self, "Could not save labels", self.status_label.text())
+            event.ignore()
+            return
+        if self.autosave_timer:
+            self.autosave_timer.stop()
+        if self.session:
+            self.session.raster.close()
+        event.accept()
 
     def _go_to_next_panel(self) -> None:
         """Button/handler: finalize current panel (NA-fill + save), then advance.
@@ -1977,6 +2018,9 @@ class MainWindow(QMainWindow):
             return
         try:
             obs_id = self.session.grid.obs_id
+            # The exported Parquet must carry the same source identity as saves.
+            self.session.raster.validate_fingerprint(self.session.labels.metadata.get("source"))
+            self.session.labels.metadata["source"] = self.session.raster.fingerprint()
             out_dir = Path("exports") / obs_id
             out_dir.mkdir(parents=True, exist_ok=True)
 

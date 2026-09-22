@@ -255,10 +255,25 @@ Every labeling action triggers autosave checks:
 - **By label count**: every `autosave.every_n_labels` actions (default 25)
 - **By time**: every `autosave.every_seconds` seconds (default 30)
 
+Keyboard edits, undo/redo, drag painting, and selection fills all participate in
+autosave. **File → Save Labels** (`Ctrl+S` / `Cmd+S`) saves immediately. Closing
+the window or opening another observation saves the current labeling session;
+if saving fails, closing/switching is stopped so the edits remain available.
+Prediction sessions retain their explicit **Save Predictions** workflow.
+
 When you reopen an observation:
 - Session resumes at last cursor position
 - All labels restored from Parquet
-- Warning if `classes.yaml` changed since last session
+- Class names refreshed from the current `classes.yaml`; keep class IDs stable
+
+Saves atomically replace the Parquet file, embedding cursor, tile geometry, and
+source-image identity in the same snapshot. A missing or damaged JSON sidecar
+does not discard labels. New saves bind labels to the exact source file (SHA-256
+plus georeferencing), rejecting a different/replaced image even with the same
+filename and dimensions. Use the original source file when reopening/exporting:
+re-encoding a JP2 as TIFF or changing its internal overviews changes this identity.
+Legacy files without source identity can only be checked using their available
+geometry and observation metadata.
 
 ## Export & Training
 
@@ -273,8 +288,38 @@ Generates:
 - `labels.csv` — Block coordinates and class IDs
 - `classes.json` — Class metadata
 
+PNG crops preserve the source's native **uint8 or uint16** pixel values without
+display stretching. CSV class names are quoted correctly, including names with
+commas; rows also record crop filename, dimensions, and dtype. Export checks
+source identity, block coordinates, bounds, duplicate IDs, and class IDs before
+publishing a complete set. Choose a **new or empty output directory** for each
+export, so older crops cannot remain mixed with newer labels.
+
+This is a block-classification probe set. The coarse GeoTIFF uses class IDs
+unchanged (0-based), with 253=abstain, 254=nodata, 255=unlabeled. AI4ExoMars's
+Stage-3 segmentation loader instead expects 1-based raster labels with 0=ignore
+and uint8 imagery: do not feed the coarse display export directly into that
+loader without explicit label remapping and imagery preprocessing.
+
 ### Export to GeoTIFF
-Done automatically on exit (future: manual export button). Produces coarse-grid GeoTIFF aligned to source CRS, ready for QGIS.
+Use **Export Labels** to write the coarse-grid GeoTIFF, Parquet, and class metadata
+to `exports/<obs_id>/`. The GeoTIFF preserves the source CRS and affine alignment.
+
+### Verify the complete workflow on an observation
+
+With GUI and inference dependencies installed, run:
+
+```bash
+QT_QPA_PLATFORM=offscreen python scripts/verify_labeling_workflow.py observation.JP2 \
+  --output exports/workflow-check
+```
+
+This drives real Qt tile clicks and hotkeys, autosave, clear/undo/redo, close and
+reopen, and export. It compares all six exported crops pixel-for-pixel to the
+source, checks CSV/GeoTIFF alignment, and runs a shuffled CPU PyTorch training
+batch with a backward/optimizer step. It writes screenshots, a contact sheet,
+and `verification.json`. Trial labels are mechanical QA examples, **not scientific
+annotations**, and are isolated in the new output directory.
 
 ## Configuration
 

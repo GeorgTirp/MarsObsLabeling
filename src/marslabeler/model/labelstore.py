@@ -14,6 +14,9 @@ import pyarrow.parquet as pq
 from pyarrow import Array, ChunkedArray, compute as pc
 
 from marslabeler.model.grid import BlockInfo, Grid
+from marslabeler.io.atomic import atomic_output
+
+METADATA_KEY = b"marslabeler.session"
 
 
 class LabelRecord:
@@ -122,6 +125,7 @@ class LabelStore:
         self.records: dict[str, LabelRecord] = {}
         self.undo_stack: list[dict[str, LabelRecord]] = []
         self.redo_stack: list[dict[str, LabelRecord]] = []
+        self.metadata: dict = {}
 
         # Initialize all blocks as unlabeled
         for block in grid.iter_blocks():
@@ -405,10 +409,26 @@ class LabelStore:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         table = self.to_parquet_table()
-        pq.write_table(table, str(path))
+        metadata = dict(self.metadata)
+        metadata.update({
+            "obs_id": self.grid.obs_id,
+            "img_width": self.grid.img_width,
+            "img_height": self.grid.img_height,
+            "panel_size": self.grid.panel_size,
+            "block_size": self.grid.block_size,
+        })
+        table = table.replace_schema_metadata({METADATA_KEY: json.dumps(metadata).encode()})
+        with atomic_output(path) as temporary:
+            pq.write_table(table, str(temporary))
+
+    @staticmethod
+    def read_metadata(path: Path) -> dict:
+        metadata = pq.read_schema(path).metadata or {}
+        return json.loads(metadata.get(METADATA_KEY, b"{}"))
 
     @classmethod
-    def load_parquet(cls, path: Path, grid: Grid, labeler: str = "unknown") -> "LabelStore":
+    def load_parquet(cls, path: Path, grid: Grid, labeler: str = "unknown",
+                     strict: bool = False) -> "LabelStore":
         """Load labels from a Parquet file, keeping only records this grid owns.
 
         Block ids are ``{obs_id}_{x_px}_{y_px}``, so a file written at a different
@@ -422,6 +442,7 @@ class LabelStore:
         """
         store = cls(grid, labeler)
         table = pq.read_table(str(path))
+        store.metadata = cls.read_metadata(path)
 
         geometry = {
             block.block_id: (block.x_px, block.y_px, block.w_px, block.h_px)
@@ -430,22 +451,41 @@ class LabelStore:
 
         rejected_unknown = 0
         rejected_geometry = 0
-        for i in range(len(table)):
-            row = table.slice(i, 1).to_pydict()
-            data = {k: v[0] for k, v in row.items()}
+        seen = set()
+        for data in table.to_pylist():
             block_id = data["block_id"]
+            if block_id in seen:
+                raise ValueError(f"Duplicate saved block id: {block_id}")
+            seen.add(block_id)
+            cid, status = data.get("class_id"), data.get("status")
+            if not isinstance(cid, int) or not (
+                (status == "labeled" and cid >= 0)
+                or {"unlabeled": -3, "nodata": -2, "abstain": -1}.get(status) == cid
+            ):
+                raise ValueError(f"Invalid saved class/status for block {block_id}")
 
             expected = geometry.get(block_id)
             if expected is None:
+                if strict:
+                    raise ValueError(f"Saved block does not belong to this grid: {block_id}")
                 rejected_unknown += 1
                 continue
             stored = (data.get("x_px"), data.get("y_px"),
                       data.get("w_px"), data.get("h_px"))
             if any(v is not None for v in stored) and tuple(stored) != expected:
+                if strict:
+                    raise ValueError(f"Saved block extent does not match this grid: {block_id}")
                 rejected_geometry += 1
                 continue
 
-            store.records[block_id] = LabelRecord.from_dict(data)
+            # Panel geometry and map metadata belong to the current grid; an old
+            # panel layout must not change a block's pixel identity.
+            geometry_record = store.records[block_id]
+            record = LabelRecord.from_dict(data)
+            for field in ("obs_id", "panel_row", "panel_col", "block_row", "block_col",
+                          "map_x", "map_y", "gsd"):
+                setattr(record, field, getattr(geometry_record, field))
+            store.records[block_id] = record
 
         skipped = rejected_unknown + rejected_geometry
         if skipped:

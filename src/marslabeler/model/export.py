@@ -46,7 +46,9 @@ def export_coarse_geotiff(
         # Assign class_id (offset nodata/abstain to valid uint8 range)
         if record.status == "labeled":
             # User-assigned class (>= 0)
-            data[output_row, output_col] = record.class_id & 0xFF
+            if not 0 <= record.class_id < 253 or record.class_id == nodata_value:
+                raise ValueError(f"Class id {record.class_id} cannot be represented in the coarse uint8 export")
+            data[output_row, output_col] = record.class_id
         elif record.status == "abstain":
             # Abstain (-1) → map to 253
             data[output_row, output_col] = 253
@@ -60,14 +62,7 @@ def export_coarse_geotiff(
     # (c, a*block_size, 0, f, 0, e*block_size)
     src_transform = grid.transform
     scale = grid.block_size
-    coarse_transform = Affine(
-        src_transform.a * scale,
-        src_transform.b,
-        src_transform.c,
-        src_transform.d,
-        src_transform.e * scale,
-        src_transform.f,
-    )
+    coarse_transform = src_transform * Affine.scale(scale)
 
     # Write GeoTIFF
     kwargs = {

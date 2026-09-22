@@ -202,14 +202,20 @@ class KeyboardController:
 
     def _handle_undo(self) -> bool:
         """Undo last label action."""
+        if self.session.labels.undo_stack:
+            self.session.mark_changed()
         self.session.labels.undo()
+        self.last_action_type = "undo"
         if self.on_label_changed:
             self.on_label_changed()
         return True
 
     def _handle_redo(self) -> bool:
         """Redo last undone action."""
+        if self.session.labels.redo_stack:
+            self.session.mark_changed()
         self.session.labels.redo()
+        self.last_action_type = "redo"
         if self.on_label_changed:
             self.on_label_changed()
         return True
@@ -222,9 +228,7 @@ class KeyboardController:
 
     def should_autosave(self) -> bool:
         """Check if autosave should trigger based on last action."""
-        if self.last_action_type in ("label", "abstain", "clear"):
-            return self.session.should_autosave()
-        return False
+        return self.session.should_autosave()
 
     def reset_autosave(self) -> None:
         """Reset autosave counter after saving."""
