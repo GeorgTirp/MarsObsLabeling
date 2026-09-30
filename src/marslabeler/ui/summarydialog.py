@@ -220,11 +220,15 @@ class ClassSummaryView(QWidget):
 
     def _build_class_section(self, cls) -> QWidget:
         frame = QFrame()
+        frame.setObjectName("classSummaryCard")
         frame.setStyleSheet(
-            "QFrame { background-color: #1a1a1a; border: 1px solid #555; "
-            "border-radius: 6px; padding: 8px; }"
+            "QFrame#classSummaryCard { background-color: #19222c; "
+            "border: 1px solid #2c3947; border-radius: 5px; }"
+            "QFrame#classSummaryCard QWidget { background: transparent; }"
         )
         layout = QVBoxLayout()
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
         frame.setLayout(layout)
 
         # --- Header: swatch + name ---
@@ -233,13 +237,13 @@ class ClassSummaryView(QWidget):
         pixmap = QPixmap(28, 28)
         pixmap.fill(QColor(cls.color))
         swatch.setPixmap(pixmap)
-        swatch.setStyleSheet("border: 1px solid #666; border-radius: 3px;")
+        swatch.setFixedSize(28, 28)
         header.addWidget(swatch)
 
         name = QLabel(cls.name)
+        name.setWordWrap(True)
         name.setStyleSheet("font-weight: bold; font-size: 14px; color: #ffffff;")
-        header.addWidget(name)
-        header.addStretch()
+        header.addWidget(name, 1)
         layout.addLayout(header)
 
         # --- Neural PCA row ---
@@ -328,7 +332,7 @@ class ClassSummaryView(QWidget):
                     "calibration pass (AI4ExoMars/vision_backend/pc_align/fit_neural_pca.py)."
                 )
             placeholder = QLabel(text)
-            placeholder.setStyleSheet("color: #888; font-style: italic; font-size: 11px;")
+            placeholder.setStyleSheet("color: #91a0b2; font-size: 11px;")
             placeholder.setWordWrap(True)
             grid.addWidget(placeholder, 0, 0)
             return row
@@ -340,7 +344,7 @@ class ClassSummaryView(QWidget):
             col_widget.setLayout(col_layout)
 
             title = QLabel(f"Component {component_idx + 1}")
-            title.setStyleSheet("color: #8AB4F8; font-size: 10px; font-weight: bold;")
+            title.setStyleSheet("color: #e6a079; font-size: 10px; font-weight: bold;")
             col_layout.addWidget(title)
 
             thumbnails_row = QHBoxLayout()

@@ -35,6 +35,20 @@ def test_main_layout_is_a_splitter(window):
     assert isinstance(window.main_layout, QSplitter)
 
 
+@pytest.mark.parametrize("predictions_mode", [False, True])
+def test_workspace_fits_laptop_on_first_show(qapp, predictions_mode):
+    win = MainWindow(Path("configs/app.yaml"), predictions_mode=predictions_mode)
+    win.resize(1440, 900)
+    win.show()
+    qapp.processEvents()
+    assert win.width() == 1440
+    assert win.height() == 900
+    assert not win.workspace_save_button.isEnabled()
+    assert win.empty_workspace.isVisible()
+    win.close()
+    win.deleteLater()
+
+
 def test_splitter_has_history_canvas_legend_and_right_sidebar(window):
     splitter = window.main_layout
     assert splitter.count() == 4

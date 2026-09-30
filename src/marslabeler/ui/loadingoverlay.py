@@ -47,7 +47,7 @@ class LoadingOverlay(QWidget):
                 height: 25px;
             }
             QProgressBar::chunk {
-                background-color: #4C72B0;
+                background-color: #b65d32;
                 border-radius: 3px;
             }
             """

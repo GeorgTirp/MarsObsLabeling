@@ -1,5 +1,4 @@
-"""Legend panel: class definitions as full-width color blocks with the class
-name written directly on the swatch, plus its hotkey.
+"""Terrain legend with restrained color swatches and keyboard shortcuts.
 
 Lives in its own full-height column of MainWindow's splitter (between the
 canvas and the right-hand preview/actions column), so the whole class list is
@@ -26,14 +25,12 @@ from marslabeler.classes import ClassScheme
 # Minimum height of one class block. Enough for a two-line wrapped name (the
 # longest NOAH-H DC names run ~50 chars) without the row collapsing to text
 # height at narrow column widths.
-CLASS_ROW_MIN_HEIGHT = 38
+CLASS_ROW_MIN_HEIGHT = 34
 
 
 def contrast_text_color(hex_color: str) -> str:
     """Black or white -- whichever has the higher WCAG contrast ratio against
-    `hex_color`. Needed because the class name is drawn *on* the swatch, and
-    the 14-class palette spans a wide lightness range (a fixed white would be
-    unreadable on the light olives/cyans, a fixed black on the dark blues).
+    `hex_color`. Useful when rendering class labels directly over imagery.
     """
     color = QColor(hex_color)
 
@@ -74,15 +71,18 @@ class ClassRow(QFrame):
 
 
 class LegendPanel(QWidget):
-    """Displays terrain classes as color blocks labeled with name + hotkey."""
+    """Displays terrain classes with a swatch, name and hotkey."""
 
     def __init__(self, classes_scheme: ClassScheme, parent=None):
         super().__init__(parent)
         self.classes_scheme = classes_scheme
+        self.current_class_id: Optional[int] = None
+        self._class_rows: dict[int, ClassRow] = {}
+        self.setObjectName("legendPanel")
         # Wide enough for the longest class name to wrap to ~2 lines; the
         # column is user-resizable (MainWindow's splitter) so this is a floor,
         # not a cap.
-        self.setMinimumWidth(210)
+        self.setMinimumWidth(230)
 
         # Set by MainWindow after construction; opens the per-class Summary window
         # (coverage + confidence/uncertainty stats + neural-PCA gallery).
@@ -91,24 +91,32 @@ class LegendPanel(QWidget):
         self.on_class_clicked: Optional[Callable[[int], None]] = None
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
+        layout.setContentsMargins(10, 12, 10, 10)
+        layout.setSpacing(8)
         self.setLayout(layout)
 
-        title = QLabel("Classes")
-        title.setStyleSheet("font-weight: bold; padding: 2px;")
-        layout.addWidget(title)
+        header = QHBoxLayout()
+        title = QLabel("TERRAIN CLASSES")
+        title.setStyleSheet("color: #91a0b2; font-size: 10px; font-weight: 600;")
+        header.addWidget(title)
+        header.addStretch()
+        count = QLabel(str(len(self.classes_scheme.classes)))
+        count.setStyleSheet("color: #91a0b2; font-size: 10px;")
+        header.addWidget(count)
+        layout.addLayout(header)
 
         # Scroll area is an overflow guard for short windows only -- in its own
         # full-height column the whole list normally fits with no scrolling.
         scroll = QScrollArea()
+        self.scroll_area = scroll
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         list_widget = QWidget()
         list_layout = QVBoxLayout()
-        list_layout.setSpacing(3)
+        list_layout.setSpacing(2)
         list_layout.setContentsMargins(0, 0, 0, 0)
         list_widget.setLayout(list_layout)
 
@@ -120,7 +128,9 @@ class LegendPanel(QWidget):
         scroll.setWidget(list_widget)
         layout.addWidget(scroll, 1)
 
-        self.summary_button = QPushButton("\U0001F4CA Summary")
+        self.summary_button = QPushButton("Class summary")
+        self.summary_button.setMinimumHeight(32)
+        self.summary_button.setToolTip("Inspect class coverage, confidence and representative blocks")
         self.summary_button.clicked.connect(self._on_summary_clicked)
         layout.addWidget(self.summary_button)
 
@@ -132,22 +142,48 @@ class LegendPanel(QWidget):
         if self.on_class_clicked:
             self.on_class_clicked(class_id)
 
-    def _create_class_row(self, class_obj) -> QWidget:
-        """One class as a color block with its name written on it + hotkey badge."""
-        text_color = contrast_text_color(class_obj.color)
-        # Translucent shades of the text color, so the keycap reads as an inset
-        # on any swatch without introducing a third hue.
-        keycap_fill = "rgba(255, 255, 255, 0.25)" if text_color == "#ffffff" else "rgba(0, 0, 0, 0.16)"
-        keycap_edge = "rgba(255, 255, 255, 0.65)" if text_color == "#ffffff" else "rgba(0, 0, 0, 0.45)"
+    def set_current_class(self, class_id: Optional[int]) -> None:
+        """Highlight the current block's assigned class, independent of the brush."""
+        if class_id not in self._class_rows:
+            class_id = None
+        if class_id != self.current_class_id:
+            for cid in (self.current_class_id, class_id):
+                if cid is None:
+                    continue
+                row = self._class_rows[cid]
+                current = cid == class_id
+                row.setProperty("currentClass", current)
+                row.setAccessibleDescription("Assigned to the current block" if current else "")
+                row.findChild(QLabel, "currentClassMarker").setText("✓" if current else "")
+                for widget in (row, *row.findChildren(QLabel)):
+                    widget.style().unpolish(widget)
+                    widget.style().polish(widget)
+                    widget.update()
+            self.current_class_id = class_id
+        if class_id is not None:
+            self.scroll_area.ensureWidgetVisible(self._class_rows[class_id], 0, 8)
 
+    def _create_class_row(self, class_obj) -> QWidget:
+        """A neutral row keeps the terrain color distinct from interface state."""
         frame = ClassRow(class_obj.id)
+        self._class_rows[class_obj.id] = frame
+        frame.setObjectName("terrainClassRow")
+        frame.setProperty("currentClass", False)
+        frame.setAccessibleName(f"Assign {class_obj.name}")
         frame.clicked.connect(self._emit_class_clicked)
         frame.setMinimumHeight(CLASS_ROW_MIN_HEIGHT)
         frame.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         frame.setStyleSheet(
-            f"QFrame {{ background-color: {class_obj.color}; "
-            "border: 1px solid rgba(0, 0, 0, 0.35); border-radius: 4px; }"
-            f"QFrame:hover {{ border: 2px solid {text_color}; }}"
+            "QFrame#terrainClassRow { background-color: #19222c; "
+            "border: 1px solid transparent; border-radius: 4px; }"
+            "QFrame#terrainClassRow:hover { background-color: #24333f; "
+            "border-color: #b65d32; }"
+            'QFrame#terrainClassRow[currentClass="true"] { background-color: #423024; '
+            "border-color: #e6a079; }"
+            "QLabel#terrainClassName { color: #e6edf3; font-size: 11px; font-weight: 400; "
+            "background: transparent; border: none; }"
+            'QFrame#terrainClassRow[currentClass="true"] QLabel#terrainClassName { '
+            "color: #fff4eb; font-weight: 600; }"
         )
         frame.setToolTip(
             f"Click to assign '{class_obj.name}'"
@@ -155,29 +191,48 @@ class LegendPanel(QWidget):
         )
 
         row = QHBoxLayout()
-        row.setContentsMargins(8, 5, 6, 5)
-        row.setSpacing(6)
+        row.setContentsMargins(7, 5, 6, 5)
+        row.setSpacing(8)
         frame.setLayout(row)
 
+        swatch = QFrame()
+        swatch.setFixedWidth(5)
+        swatch.setMinimumHeight(18)
+        swatch.setStyleSheet(
+            f"background-color: {class_obj.color}; border: none; border-radius: 2px;"
+        )
+        swatch.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        row.addWidget(swatch)
+
         name = QLabel(class_obj.name)
+        name.setObjectName("terrainClassName")
         name.setWordWrap(True)
         # Children must not eat the click, or only the row's padding would be
         # clickable -- which reads as "clicking sometimes works".
         name.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        name.setStyleSheet(
-            f"color: {text_color}; font-size: 11px; font-weight: bold; "
+        row.addWidget(name, 1)
+
+        marker = QLabel("")
+        marker.setObjectName("currentClassMarker")
+        marker.setFixedWidth(12)
+        marker.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        marker.setStyleSheet(
+            "color: #f0b993; font-size: 13px; font-weight: 600; "
             "background: transparent; border: none;"
         )
-        row.addWidget(name, 1)
+        marker.setToolTip("Assigned to the current block")
+        marker.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        row.addWidget(marker)
 
         if class_obj.hotkey:
             keycap = QLabel(class_obj.hotkey.upper())
             keycap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            keycap.setMinimumWidth(18)
             keycap.setStyleSheet(
-                f"color: {text_color}; background-color: {keycap_fill}; "
-                f"border: 1px solid {keycap_edge}; border-radius: 4px; "
-                "font-family: monospace; font-size: 11px; font-weight: bold; "
-                "padding: 2px 6px;"
+                "color: #91a0b2; background-color: #141b22; "
+                "border: 1px solid #2c3947; border-radius: 3px; "
+                "font-family: monospace; font-size: 9px; font-weight: 400; "
+                "padding: 2px 3px;"
             )
             keycap.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             keycap.setToolTip(

@@ -161,6 +161,7 @@ def test_different_image_reloads_then_navigates(window_with_session, monkeypatch
         load_calls.append(path)
         # Mimic _load_observation's real effect: a fresh session for the new image.
         window.session = Session(window.session.raster, new_grid, new_labels, window.config.to_dict())
+        return True
 
     monkeypatch.setattr(window, "_load_observation", fake_load_observation)
 
@@ -172,11 +173,10 @@ def test_different_image_reloads_then_navigates(window_with_session, monkeypatch
     assert window.session.grid is new_grid
 
 
-def test_load_observation_failure_leaves_no_session_and_returns_cleanly(
+def test_cancelled_load_keeps_previous_session_without_navigating(
     window_with_session, monkeypatch, tmp_path
 ):
-    """_load_observation can fail/be cancelled (leaves self.session None,
-    per its own contract) -- must not crash trying to navigate into it."""
+    """Cancelling a new observation must not navigate within the previous one."""
     window = window_with_session
     other_tif = tmp_path / "other_mosaic.tif"
     other_tif.write_bytes(b"fake")
@@ -185,11 +185,15 @@ def test_load_observation_failure_leaves_no_session_and_returns_cleanly(
         lambda *a, **k: other_tif,
     )
 
+    previous_session = window.session
+    previous_idx = previous_session.current_block_idx
+
     def failing_load_observation(path):
-        window.session = None  # matches _load_observation's own cancel/failure contract
+        return False
 
     monkeypatch.setattr(window, "_load_observation", failing_load_observation)
 
     window._on_npca_thumbnail_clicked("other_mosaic_9_1")  # must not raise
 
-    assert window.session is None
+    assert window.session is previous_session
+    assert window.session.current_block_idx == previous_idx

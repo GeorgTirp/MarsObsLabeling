@@ -6,6 +6,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
     QLabel,
     QScrollArea,
     QFrame,
@@ -24,6 +25,7 @@ class HistoryPanel(QWidget):
 
     def __init__(self, grid: Grid, label_store: LabelStore, parent=None, hidden_panels=None):
         super().__init__(parent)
+        self.setObjectName("historyPanel")
         self.grid = grid
         self.label_store = label_store
         self.hidden_panels = set(hidden_panels or ())  # fully empty panels to omit
@@ -34,26 +36,38 @@ class HistoryPanel(QWidget):
         self.panel_frames: dict[int, QFrame] = {}
         self.panel_bars: dict[int, QProgressBar] = {}
         self.panel_labels: dict[int, QLabel] = {}
+        self.panel_counts: dict[int, QLabel] = {}
+        self.panel_statuses: dict[int, QLabel] = {}
 
-        self.setMaximumWidth(200)
+        self.setMinimumWidth(140)
+        self.setMaximumWidth(220)
 
         layout = QVBoxLayout()
+        layout.setContentsMargins(10, 12, 10, 10)
+        layout.setSpacing(10)
         self.setLayout(layout)
 
-        # Title
-        title = QLabel("Panels")
-        title.setStyleSheet("font-weight: bold; padding: 4px;")
-        layout.addWidget(title)
+        header = QHBoxLayout()
+        title = QLabel("PANELS")
+        title.setStyleSheet("color: #91a0b2; font-size: 10px; font-weight: 600;")
+        header.addWidget(title)
+        header.addStretch()
+        count = QLabel(str(sum(i not in self.hidden_panels for i in range(grid.num_panels))))
+        count.setStyleSheet("color: #91a0b2; font-size: 10px;")
+        header.addWidget(count)
+        layout.addLayout(header)
 
         # Scrollable panel list
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea { border: 1px solid #444; }")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
 
         list_widget = QWidget()
         list_layout = QVBoxLayout()
-        list_layout.setSpacing(2)
-        list_layout.setContentsMargins(4, 4, 4, 4)
+        list_layout.setSpacing(5)
+        list_layout.setContentsMargins(0, 0, 0, 0)
         list_widget.setLayout(list_layout)
 
         # Add panel items (skip fully-empty/no-data panels)
@@ -84,33 +98,51 @@ class HistoryPanel(QWidget):
     def _create_panel_item(self, panel_idx: int) -> QWidget:
         """Create a visual item for a panel."""
         frame = QFrame()
+        frame.setObjectName("panelNavigationRow")
         frame.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QGridLayout()
-        layout.setSpacing(4)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(6)
+        layout.setContentsMargins(9, 9, 9, 9)
         frame.setLayout(layout)
 
         # Panel label
         panel_row, panel_col = divmod(panel_idx, self.grid.panels_across)
         label = QLabel(f"Panel ({panel_row}, {panel_col})")
-        label.setStyleSheet("font-weight: bold;")
         # Let clicks pass through to the frame so the whole card is clickable
         label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         layout.addWidget(label, 0, 0, 1, 2)
+
+        count = QLabel()
+        count.setStyleSheet("color: #91a0b2; font-size: 10px; background: transparent;")
+        count.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(count, 1, 0)
+
+        status = QLabel()
+        status.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        status.setStyleSheet("color: #91a0b2; font-size: 9px; background: transparent;")
+        status.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        layout.addWidget(status, 1, 1)
 
         # Progress bar
         total_blocks = self.grid.blocks_per_panel
         progress = QProgressBar()
         progress.setMaximum(total_blocks)
-        progress.setTextVisible(True)
+        progress.setTextVisible(False)
+        progress.setFixedHeight(3)
+        progress.setStyleSheet(
+            "QProgressBar { background: #2c3947; border: none; border-radius: 1px; }"
+            "QProgressBar::chunk { background: #b65d32; border-radius: 1px; }"
+        )
         progress.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        layout.addWidget(progress, 1, 0, 1, 2)
+        layout.addWidget(progress, 2, 0, 1, 2)
 
         # Store refs
         self.panel_frames[panel_idx] = frame
         self.panel_bars[panel_idx] = progress
         self.panel_labels[panel_idx] = label
+        self.panel_counts[panel_idx] = count
+        self.panel_statuses[panel_idx] = status
 
         # Click handler
         def on_click():
@@ -133,6 +165,10 @@ class HistoryPanel(QWidget):
         bar.setMaximum(total_blocks)
         bar.setValue(labeled)
         bar.setFormat(f"{labeled}/{total_blocks}")
+        self.panel_counts[panel_idx].setText(f"{labeled} / {total_blocks}")
+        self.panel_statuses[panel_idx].setText(
+            "ACTIVE" if is_current else "DONE" if complete else ""
+        )
 
         panel_row, panel_col = divmod(panel_idx, self.grid.panels_across)
         label = self.panel_labels[panel_idx]
@@ -141,25 +177,26 @@ class HistoryPanel(QWidget):
 
         if complete:
             label.setText(f"✓ {name}")
-            label.setStyleSheet("font-weight: bold; color: #7ED957;")
         else:
             label.setText(name)
-            label.setStyleSheet("font-weight: bold;")
+        label.setStyleSheet(
+            "font-size: 11px; font-weight: 500; background: transparent; border: none; "
+            f"color: {'#e6a079' if is_current or complete else '#e6edf3'};"
+        )
+        frame.setAccessibleName(f"{name}, {labeled} of {total_blocks} blocks complete")
 
         if is_current:
             # Border color always wins over the done/not-done fill so the active
             # panel stays findable in the list regardless of its completion state.
-            border = "3px solid #FFEB3B"
-            bg = "#1f3d1f" if complete else "#3d3a1f"
-        elif complete:
-            border = "1px solid #4CAF50"
-            bg = "#1f3d1f"
+            border = "1px solid #b65d32"
+            bg = "#38281f"
         else:
-            border = "1px solid #444"
-            bg = "#2a2a2a"
+            border = "1px solid #2c3947"
+            bg = "#19222c"
         frame.setStyleSheet(
-            f"QFrame {{ background-color: {bg}; border: {border}; "
-            "border-radius: 2px; padding: 4px; }"
+            f"QFrame#panelNavigationRow {{ background-color: {bg}; border: {border}; "
+            "border-radius: 4px; }"
+            "QFrame#panelNavigationRow:hover { border-color: #b65d32; }"
         )
 
         if is_current and complete:
@@ -172,7 +209,7 @@ class HistoryPanel(QWidget):
             frame.setToolTip("")
 
     def set_current_panel(self, panel_idx: Optional[int]) -> None:
-        """Mark panel_idx as the one open in the canvas right now (yellow border)."""
+        """Mark panel_idx as the one open in the canvas right now."""
         if panel_idx == self.current_panel_idx:
             return
         previous = self.current_panel_idx

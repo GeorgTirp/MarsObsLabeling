@@ -116,3 +116,26 @@ def test_row_children_do_not_swallow_the_click(qtbot_app, scheme):
         assert child.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents), (
             f"{child.text()!r} would swallow the row click"
         )
+
+
+def test_current_class_scrolls_into_view_without_taking_focus(qtbot_app, scheme):
+    from PySide6.QtCore import QPoint
+
+    panel = LegendPanel(scheme)
+    panel.resize(250, 300)
+    panel.show()
+    panel.summary_button.setFocus()
+    qtbot_app.processEvents()
+    focused = qtbot_app.focusWidget()
+    assert focused is panel.summary_button
+
+    panel.set_current_class(scheme.abstain.id)
+    qtbot_app.processEvents()
+    row = next(r for r in panel.findChildren(ClassRow) if r._class_id == scheme.abstain.id)
+    viewport = panel.scroll_area.viewport()
+    top = row.mapTo(viewport, QPoint(0, 0)).y()
+    assert top >= 0
+    assert top + row.height() <= viewport.height()
+    assert qtbot_app.focusWidget() is focused
+    panel.close()
+    panel.deleteLater()

@@ -25,7 +25,7 @@ class PanelCanvas(QGraphicsView):
         super().__init__(parent)
         self.scene = QGraphicsScene()
         self.setScene(self.scene)
-        self.setBackgroundBrush(Qt.GlobalColor.black)
+        self.setBackgroundBrush(QColor("#0c1117"))
         # Overlays are pre-rasterized to fixed-size pixmaps, then scaled by the view's
         # zoom transform. Without SmoothPixmapTransform, Qt's default nearest-neighbor
         # scaling can drop thin (1px) grid lines entirely at certain non-integer scale
@@ -109,7 +109,7 @@ class PanelCanvas(QGraphicsView):
             self.canvas_width,
             self.canvas_height,
             self.block_width,
-            QColor(0, 255, 0),
+            QColor(194, 128, 86, 170),
             line_width=2,
         )
 
@@ -206,7 +206,7 @@ class PanelCanvas(QGraphicsView):
             self.block_height,
             block_row,
             block_col,
-            QColor(255, 255, 0),
+            QColor("#f0cf83"),
             line_width=3,
         )
 
@@ -258,8 +258,8 @@ class PanelCanvas(QGraphicsView):
         h = (r1 - r0 + 1) * self.block_height
 
         if self.selection_item is None:
-            pen = QPen(QColor(255, 255, 0), 2, Qt.PenStyle.SolidLine)
-            brush = QBrush(QColor(255, 255, 0, 60))  # translucent yellow fill
+            pen = QPen(QColor("#f0cf83"), 2, Qt.PenStyle.SolidLine)
+            brush = QBrush(QColor(240, 207, 131, 45))
             self.selection_item = self.scene.addRect(x, y, w, h, pen, brush)
             self.selection_item.setZValue(10)  # above overlays
         else:

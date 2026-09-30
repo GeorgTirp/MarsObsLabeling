@@ -2,6 +2,7 @@
 
 import traceback
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +21,9 @@ from PySide6.QtWidgets import (
     QApplication,
     QPushButton,
     QMessageBox,
+    QFrame,
+    QSizePolicy,
+    QScrollArea,
 )
 from PySide6.QtGui import QAction, QKeyEvent, QKeySequence
 
@@ -37,6 +41,7 @@ from marslabeler.ui.controller import KeyboardController
 from marslabeler.ui.preprocessdialog import PreprocessDialog
 from marslabeler.ui.helpdialog import HelpDialog
 from marslabeler.ui.loadingoverlay import LoadingOverlay
+from marslabeler.ui.theme import apply_theme
 from marslabeler.model.export import export_coarse_geotiff, export_class_metadata
 
 
@@ -56,8 +61,9 @@ class MainWindow(QMainWindow):
         predictions_mode: bool = False,
     ):
         super().__init__()
-        self.setWindowTitle("Mars Obs Labeler")
-        self.setGeometry(100, 100, 1920, 1080)
+        apply_theme()
+        self.setWindowTitle("Mars Obs · Observation workspace")
+        self.resize(1440, 900)
 
         # Load config
         if config_path is None:
@@ -148,27 +154,38 @@ class MainWindow(QMainWindow):
 
     def _setup_ui(self):
         """Build UI layout."""
+        workspace = QWidget()
+        shell = QVBoxLayout(workspace)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+        self.setCentralWidget(workspace)
+        self._setup_workspace_header(shell)
+
         # Main layout: history | canvas | legend | preview+actions, as a splitter
         # so each column can be dragged wider/narrower live. The legend gets its
         # own full-height column (rather than being stacked under the preview)
         # so all classes are readable at once without scrolling.
         main_layout = QSplitter(Qt.Horizontal)
         main_layout.setChildrenCollapsible(False)
-        self.setCentralWidget(main_layout)
+        main_layout.setHandleWidth(3)
+        shell.addWidget(main_layout, 1)
         self.main_layout = main_layout
 
         # Left: History panel (placeholder until session loads)
-        self.history_panel = QLabel("(No session)")
+        self.history_panel = self._empty_panel("PANELS", "Open an observation\nto navigate its panels.")
+        self.history_panel.setMinimumWidth(140)
         self.history_panel.setMaximumWidth(200)
         main_layout.addWidget(self.history_panel)
 
         # Center: Panel canvas
         self.canvas = PanelCanvas()
+        self.canvas.setMinimumWidth(280)
         self.canvas.on_block_clicked = self._on_block_clicked
         self.canvas.on_block_paint = self._on_block_paint
         self.canvas.on_block_paint_end = self._on_block_paint_end
         self.canvas.on_selection_made = self._on_selection_made
         main_layout.addWidget(self.canvas)
+        self._setup_empty_workspace()
         # The Class Summary replaces the canvas IN THIS COLUMN rather than opening
         # its own window: on macOS a non-modal child of a fullscreen/maximised
         # window is placed on a different Space and never surfaces, so "open"
@@ -179,21 +196,24 @@ class MainWindow(QMainWindow):
         self._showing_summary = False
 
         # Legend column (placeholder until a session loads and classes are known)
-        self.legend_panel = QLabel("(No session)")
+        self.legend_panel = self._empty_panel("TERRAIN CLASSES", "Your class scheme and\nshortcuts will appear here.")
+        self.legend_panel.setMinimumWidth(210)
         main_layout.addWidget(self.legend_panel)
 
         # Right: Preview (top) + action buttons
         right_layout = QVBoxLayout()
+        right_layout.setContentsMargins(14, 16, 14, 14)
+        right_layout.setSpacing(8)
         self.right_layout = right_layout
 
         # Side preview (top)
         self.preview = SidePreview()
         right_layout.addWidget(self.preview)
 
-        right_layout.addStretch()
+        right_layout.addWidget(self._section_label("VIEW & ANALYSIS"))
 
         # Action buttons (disabled until a session loads)
-        self.overview_button = QPushButton("Overview (O)  ⤢")
+        self.overview_button = QPushButton("Observation overview     O")
         self.overview_button.setEnabled(False)
         self.overview_button.setCheckable(True)
         self.overview_button.clicked.connect(self._toggle_overview)
@@ -201,7 +221,7 @@ class MainWindow(QMainWindow):
 
         # Only shown in predictions mode (mars-inference): toggles the class-color
         # overlay for a Mahalanobis-distance epistemic-uncertainty heatmap.
-        self.uncertainty_button = QPushButton("\U0001F321 Uncertainty Heatmap")
+        self.uncertainty_button = QPushButton("Uncertainty heatmap")
         self.uncertainty_button.setEnabled(False)
         self.uncertainty_button.setCheckable(True)
         self.uncertainty_button.setVisible(self.predictions_mode)
@@ -218,23 +238,29 @@ class MainWindow(QMainWindow):
         # products of the prediction pass held in memory only (the .parquet cache
         # stores one class id per block), so a cache hit leaves all three empty.
         # This re-runs inference to rebuild them without restarting the app.
-        self.rerun_button = QPushButton("\u21BB Re-run inference")
+        self.rerun_button = QPushButton("Re-run inference")
         self.rerun_button.setEnabled(False)
         self.rerun_button.setVisible(self.predictions_mode)
         self.rerun_button.clicked.connect(self._rerun_inference)
         right_layout.addWidget(self.rerun_button)
 
-        self.render_mode_button = QPushButton("\U0001F5FA Pixel-wise view")
+        self.render_mode_button = QPushButton("Pixel-wise view")
         self.render_mode_button.setEnabled(False)
         self.render_mode_button.setCheckable(True)
         self.render_mode_button.setVisible(self.predictions_mode)
         self.render_mode_button.clicked.connect(self._toggle_render_mode)
         right_layout.addWidget(self.render_mode_button)
 
-        self.next_panel_button = QPushButton("Next Panel ▶  (fills rest as NA)")
+        right_layout.addStretch(1)
+        right_layout.addWidget(self._section_label("SESSION"))
+        self.next_panel_button = QPushButton("Complete && next panel")
+        self.next_panel_button.setToolTip("Fill remaining unlabeled blocks as NA, save, and advance to the next panel.")
         self.next_panel_button.setEnabled(False)
         self.next_panel_button.clicked.connect(self._go_to_next_panel)
         right_layout.addWidget(self.next_panel_button)
+        next_hint = QLabel("Remaining blocks are filled as NA.")
+        next_hint.setProperty("role", "muted")
+        right_layout.addWidget(next_hint)
 
         self.export_button = QPushButton("Export Labels")
         self.export_button.setEnabled(False)
@@ -242,20 +268,30 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.export_button)
 
         # Only shown in predictions mode (mars-inference)
-        self.save_predictions_button = QPushButton("\U0001F4BE Save Predictions")
+        self.save_predictions_button = QPushButton("Save predictions")
+        self.save_predictions_button.setProperty("role", "primary")
         self.save_predictions_button.setEnabled(False)
         self.save_predictions_button.setVisible(self.predictions_mode)
         self.save_predictions_button.clicked.connect(self._save_predictions)
         right_layout.addWidget(self.save_predictions_button)
 
         right_widget = QWidget()
+        right_widget.setObjectName("inspector")
+        right_widget.setMinimumWidth(268)
         right_widget.setLayout(right_layout)
-        main_layout.addWidget(right_widget)
+        inspector_scroll = QScrollArea()
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inspector_scroll.setMinimumWidth(280)
+        inspector_scroll.setWidget(right_widget)
+        main_layout.addWidget(inspector_scroll)
+        for button in right_widget.findChildren(QPushButton):
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         # Canvas gets the extra space when the window resizes; history/legend/
         # right columns stay put unless the user drags a handle themselves.
         main_layout.setStretchFactor(main_layout.indexOf(self.canvas), 1)
-        main_layout.setSizes([200, 1100, 250, 320])
+        main_layout.setSizes([156, 742, 250, 280])
         # setChildrenCollapsible(False) alone leaves isCollapsible() reporting
         # True per pane in this Qt build (childrenCollapsible is the runtime
         # default; isCollapsible() reflects each pane's own override, which
@@ -267,8 +303,172 @@ class MainWindow(QMainWindow):
         # Status bar
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
-        self.status_label = QLabel("Ready")
-        self.statusBar.addWidget(self.status_label)
+        self.status_label = QLabel("Ready · Open a JP2 or GeoTIFF observation to begin")
+        self.status_label.setMinimumWidth(0)
+        self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.statusBar.addWidget(self.status_label, 1)
+        self.statusBar.addPermanentWidget(QLabel("LOCAL WORKSPACE"))
+
+    @staticmethod
+    def _section_label(text):
+        label = QLabel(text)
+        label.setProperty("role", "section")
+        label.setContentsMargins(0, 8, 0, 4)
+        return label
+
+    def _empty_panel(self, title, message):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(14, 16, 14, 14)
+        layout.addWidget(self._section_label(title))
+        description = QLabel(message)
+        description.setWordWrap(True)
+        description.setProperty("role", "muted")
+        layout.addWidget(description)
+        layout.addStretch()
+        return panel
+
+    def _workspace_button(self, text, callback, *, primary=False):
+        button = QPushButton(text)
+        button.setProperty("role", "primary" if primary else "compact")
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.clicked.connect(callback)
+        return button
+
+    def _setup_workspace_header(self, shell):
+        header = QFrame()
+        header.setObjectName("workspaceHeader")
+        row = QHBoxLayout(header)
+        row.setContentsMargins(20, 12, 20, 12)
+        row.setSpacing(14)
+        mark = QLabel("M")
+        mark.setObjectName("brandMark")
+        row.addWidget(mark)
+        identity = QVBoxLayout()
+        identity.setSpacing(2)
+        brand = QLabel("MARS OBS")
+        brand.setObjectName("brand")
+        identity.addWidget(brand)
+        tagline = QLabel("SURFACE OBSERVATION WORKSPACE")
+        tagline.setProperty("role", "section")
+        identity.addWidget(tagline)
+        row.addLayout(identity)
+        row.addSpacing(24)
+        self.observation_label = QLabel("No observation open")
+        self.observation_label.setProperty("role", "muted")
+        self.observation_label.setMinimumWidth(0)
+        self.observation_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        row.addWidget(self.observation_label, 1)
+        badge = QLabel("PREDICTION REVIEW" if self.predictions_mode else "TERRAIN LABELING")
+        badge.setObjectName("modeBadge")
+        row.addWidget(badge)
+        row.addWidget(self._workspace_button("Open observation", self._on_open_file))
+        self.workspace_save_button = self._workspace_button(
+            "Save predictions" if self.predictions_mode else "Save labels",
+            lambda: self._save_predictions() if self.predictions_mode else self._autosave_session(),
+            primary=True,
+        )
+        self.workspace_save_button.setEnabled(False)
+        row.addWidget(self.workspace_save_button)
+        shell.addWidget(header)
+
+        toolbar = QFrame()
+        toolbar.setObjectName("viewToolbar")
+        tools = QHBoxLayout(toolbar)
+        tools.setContentsMargins(16, 6, 16, 6)
+        tools.setSpacing(6)
+        self.view_label = QLabel("IMAGE VIEWER")
+        self.view_label.setProperty("role", "section")
+        tools.addWidget(self.view_label)
+        tools.addStretch()
+        hint = QLabel("Class key to label  ·  Shift + drag to select")
+        hint.setProperty("role", "muted")
+        tools.addWidget(hint)
+        tools.addSpacing(16)
+        self.zoom_out_button = self._workspace_button("−", lambda: self._workspace_zoom(False))
+        self.zoom_out_button.setToolTip("Zoom out (−)")
+        self.zoom_in_button = self._workspace_button("+", lambda: self._workspace_zoom(True))
+        self.zoom_in_button.setToolTip("Zoom in (+)")
+        self.fit_button = self._workspace_button("Fit panel", self._fit_panel)
+        self.help_button = self._workspace_button("Shortcuts  ?", self._show_help)
+        for button in (self.zoom_out_button, self.zoom_in_button, self.fit_button, self.help_button):
+            button.setEnabled(False)
+            tools.addWidget(button)
+        shell.addWidget(toolbar)
+
+    def _setup_empty_workspace(self):
+        self.empty_workspace = QWidget(self.canvas.viewport())
+        self.empty_workspace.setObjectName("emptyWorkspace")
+        wrapper = QVBoxLayout(self.canvas.viewport())
+        wrapper.setContentsMargins(0, 0, 0, 0)
+        wrapper.addWidget(self.empty_workspace)
+        content = QVBoxLayout(self.empty_workspace)
+        content.setContentsMargins(30, 30, 30, 30)
+        content.setSpacing(16)
+        content.addStretch()
+        eyebrow = QLabel("EXPLORE · LABEL · REVIEW")
+        eyebrow.setObjectName("welcomeEyebrow")
+        content.addWidget(eyebrow)
+        title = QLabel("A closer look at Mars.")
+        title.setObjectName("welcomeTitle")
+        title.setWordWrap(True)
+        content.addWidget(title)
+        description = QLabel("Open a HiRISE observation to label terrain, inspect native image crops, and review model predictions.")
+        description.setWordWrap(True)
+        description.setProperty("role", "muted")
+        description.setMaximumWidth(410)
+        content.addWidget(description)
+        content.addWidget(self._workspace_button("Open observation", self._on_open_file, primary=True), 0, Qt.AlignmentFlag.AlignLeft)
+        formats = QLabel("JP2 / GeoTIFF  ·  Existing sessions resume automatically")
+        formats.setWordWrap(True)
+        formats.setProperty("role", "muted")
+        content.addWidget(formats)
+        content.addStretch()
+
+    def _fit_panel(self):
+        if not self.session:
+            return
+        if self._showing_summary:
+            self._close_class_summary()
+        self._set_view("panel")
+        self._set_zoom(1)
+
+    def _workspace_zoom(self, zoom_in):
+        if self._showing_summary:
+            self._close_class_summary()
+        if zoom_in:
+            self._zoom_in()
+        else:
+            self._zoom_out()
+
+    def _sync_workspace(self):
+        """Keep shell metadata in sync without scanning labels or reading imagery."""
+        self._sync_legend_selection()
+        loaded = self.session is not None
+        self.empty_workspace.setVisible(not loaded)
+        for button in (self.workspace_save_button, self.zoom_out_button, self.zoom_in_button, self.fit_button):
+            button.setEnabled(loaded)
+        self.help_button.setEnabled(self.classes_scheme is not None)
+        if not loaded:
+            self.observation_label.setText("No observation open")
+            self.observation_label.setToolTip("")
+            self.view_label.setText("IMAGE VIEWER")
+            return
+        grid = self.session.grid
+        self.observation_label.setText(grid.obs_id)
+        self.observation_label.setToolTip(str(self.session.raster.path))
+        if self._showing_summary:
+            view_text = "CLASS SUMMARY   ·   COVERAGE & MODEL ANALYSIS"
+        elif self.view_mode == "overview":
+            view_text = f"OBSERVATION OVERVIEW   ·   {grid.num_panels} PANELS"
+        elif self.view_mode == "multi":
+            view_text = f"REGIONAL VIEW   ·   {self.multi_span} × {self.multi_span} PANELS"
+        else:
+            view_text = (
+                f"PANEL {self.current_panel_idx + 1:03d} / {grid.num_panels:03d}"
+                f"   ·   {grid.block_size} PX BLOCKS"
+            )
+        self.view_label.setText(view_text)
 
     def _setup_menu(self):
         """Build menu bar."""
@@ -277,7 +477,8 @@ class MainWindow(QMainWindow):
         # File menu
         file_menu = menubar.addMenu("File")
 
-        open_action = QAction("Open JP2...", self)
+        open_action = QAction("Open observation...", self)
+        open_action.setShortcut(QKeySequence.StandardKey.Open)
         open_action.triggered.connect(self._on_open_file)
         file_menu.addAction(open_action)
 
@@ -307,15 +508,16 @@ class MainWindow(QMainWindow):
         """File→Open JP2 dialog."""
         path, _ = QFileDialog.getOpenFileName(
             self,
-            "Open JP2 Observation",
+            "Open observation",
             "",
-            "JP2 Images (*.jp2);;All Files (*)",
+            "Observations (*.jp2 *.JP2 *.tif *.TIF *.tiff *.TIFF);;All Files (*)",
         )
 
         if not path:
             return
 
         self._load_observation(Path(path))
+        self._sync_workspace()
 
     def _on_set_labels_folder(self):
         """File→Set Labels Folder: choose where labels are saved to / resumed from."""
@@ -340,28 +542,39 @@ class MainWindow(QMainWindow):
             )
         self.status_label.setText(f"Labels folder: {self.labels_dir}")
 
-    def _load_observation(self, jp2_path: Path):
-        """Load a JP2 observation and create a session."""
+    def _offer_open_without_labels(self, jp2_path: Path, error: Exception) -> Optional[Path]:
+        """Offer a fresh session with a separate save destination for recovery."""
+        destination = self.labels_dir / f"{jp2_path.stem}-fresh-{datetime.now():%Y%m%d-%H%M%S-%f}"
+        warning = QMessageBox(self)
+        warning.setIcon(QMessageBox.Icon.Warning)
+        warning.setWindowTitle("Could not load saved labels")
+        warning.setText(f"The saved labels for '{jp2_path.name}' could not be loaded.")
+        warning.setInformativeText(
+            f"{error}\n\nYou can still open the observation without those labels. "
+            "Your existing files will be kept, and new labels will be saved to:\n"
+            f"{destination}"
+        )
+        open_button = warning.addButton(
+            "Open without saved labels", QMessageBox.ButtonRole.AcceptRole
+        )
+        warning.addButton(QMessageBox.StandardButton.Cancel)
+        warning.setDefaultButton(open_button)
+        warning.exec()
+        if warning.clickedButton() is open_button:
+            return destination
+        self.status_label.setText("Loading cancelled")
+        return None
+
+    def _load_observation(self, jp2_path: Path) -> bool:
+        """Load an observation, optionally starting fresh if saved labels fail."""
         previous_session = self.session
         if previous_session and not self.predictions_mode:
             if not self._autosave_session(note="before opening another observation"):
-                return
-        if self.predictions_mode:
-            # A new image invalidates any analysis layers computed for the previous
-            # one (load_for_inference() repopulates block_confidence/npca_gallery
-            # for its own image+model pair right after this call; a plain File ->
-            # Open of a different image while already in predictions mode has no
-            # such follow-up, so drop the stale data here rather than mislabel it).
-            self.display_layer = "classes"
-            self.block_confidence = {}
-            self.block_uncertainty = {}
-            self.uncertainty_button.setChecked(False)
-            self.uncertainty_button.setEnabled(False)
-            self.prediction_render_mode = "pixelwise"
-            self.block_pixel_predictions = {}
-            self.render_mode_button.setChecked(False)
-            self.render_mode_button.setText("\U0001F5FA Pixel-wise view")
-            self.render_mode_button.setEnabled(False)
+                return False
+        labels_dir = self.labels_dir
+        resume = not (self.predictions_mode and self.ignore_cached_predictions)
+        raster = None
+        new_session = None
 
         try:
             # Open raster
@@ -388,7 +601,26 @@ class MainWindow(QMainWindow):
             # Reconcile with any saved labels for this observation: they may have been
             # made for a different image (wrong picture) or a different tile resolution.
             obs_id = jp2_path.stem
-            saved = Session.read_saved_metadata(self.labels_dir, obs_id)
+            saved = None
+            if resume:
+                try:
+                    saved = Session.read_saved_metadata(labels_dir, obs_id)
+                    if saved is not None:
+                        if not isinstance(saved, dict):
+                            raise ValueError("Saved label metadata is not a valid object.")
+                        for field in ("block_size", "panel_size", "img_width", "img_height"):
+                            value = saved.get(field)
+                            if value is not None and (type(value) is not int or value <= 0):
+                                raise ValueError(f"Saved labels have invalid {field}.")
+                        if (saved.get("panel_size") and saved.get("block_size")
+                                and saved["panel_size"] % saved["block_size"]):
+                            raise ValueError("Saved panel size is not divisible by the block size.")
+                except Exception as error:
+                    labels_dir = self._offer_open_without_labels(jp2_path, error)
+                    if labels_dir is None:
+                        return False
+                    saved = None
+                    resume = False
             if saved is not None:
                 # Wrong-picture guard: saved image dimensions differ from this raster.
                 saved_w, saved_h = saved.get("img_width"), saved.get("img_height")
@@ -397,23 +629,19 @@ class MainWindow(QMainWindow):
                     and saved_h is not None
                     and (saved_w != raster.width or saved_h != raster.height)
                 ):
-                    reply = QMessageBox.warning(
-                        self,
-                        "Labels may be for a different image",
-                        f"Saved labels in\n{self.labels_dir}\n"
-                        f"were made for a {saved_w}×{saved_h} px image, but "
-                        f"'{jp2_path.name}' is {raster.width}×{raster.height} px.\n\n"
-                        "You may have opened the wrong image, or pointed at the wrong "
-                        "labels folder. Loading anyway will almost certainly misalign "
-                        "the existing labels.\n\nLoad anyway?",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.No,
+                    labels_dir = self._offer_open_without_labels(
+                        jp2_path,
+                        ValueError(
+                            f"Saved labels were made for a {saved_w}×{saved_h} px image, "
+                            f"but '{jp2_path.name}' is {raster.width}×{raster.height} px."
+                        ),
                     )
-                    if reply != QMessageBox.StandardButton.Yes:
-                        self.status_label.setText("Loading cancelled")
-                        raster.close()
-                        return
+                    if labels_dir is None:
+                        return False
+                    saved = None
+                    resume = False
 
+            if saved is not None:
                 # Wrong-resolution guard: adopt the saved tile geometry so the existing
                 # labels line up (the requested --resolution is ignored for this image).
                 saved_block, saved_panel = saved.get("block_size"), saved.get("panel_size")
@@ -437,8 +665,8 @@ class MainWindow(QMainWindow):
 
             # Scale decision before anything expensive: it changes the tile size,
             # so it has to happen before the grid and the preprocessing pass.
-            self.gsd_ratio = self._resolve_gsd_scaling(raster)
-            if self.gsd_ratio != 1.0:
+            gsd_ratio = self._resolve_gsd_scaling(raster)
+            if gsd_ratio != 1.0:
                 from marslabeler.inference.modelio import (
                     REQUIRED_STRIDE,
                     native_block_size_for_gsd,
@@ -448,7 +676,7 @@ class MainWindow(QMainWindow):
                 # to shrink to match -- otherwise a block would extend beyond the
                 # window that predicted it.
                 stride = REQUIRED_STRIDE.get("simmim", 256)
-                block_size = native_block_size_for_gsd(block_size, stride, self.gsd_ratio)
+                block_size = native_block_size_for_gsd(block_size, stride, gsd_ratio)
                 panel_size = max(block_size, (panel_size // block_size) * block_size)
                 self.status_label.setText(
                     f"Scale-matched tiles: {block_size}px "
@@ -474,8 +702,7 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.StandardButton.Yes:
                     self.status_label.setText("Loading cancelled")
-                    raster.close()
-                    return
+                    return False
 
             # Create grid
             grid = Grid(
@@ -489,20 +716,55 @@ class MainWindow(QMainWindow):
             )
 
             # Load classes
-            self.classes_scheme = load_classes(self.config.paths.classes_file)
-            self._resolve_na_class()
+            classes_scheme = load_classes(self.config.paths.classes_file)
 
             # Create or load session
-            self.session = Session.load_or_create(
-                jp2_path,
-                grid,
-                self.config.to_dict(),
-                self.labels_dir,
-                labeler=self.config.labeler or "unknown",
-                resume=not (self.predictions_mode and self.ignore_cached_predictions),
-            )
+            try:
+                new_session = Session.load_or_create(
+                    jp2_path, grid, self.config.to_dict(), labels_dir,
+                    labeler=self.config.labeler or "unknown", resume=resume,
+                )
+            except Exception as error:
+                if not resume or not (labels_dir / f"{obs_id}.parquet").exists():
+                    raise
+                labels_dir = self._offer_open_without_labels(jp2_path, error)
+                if labels_dir is None:
+                    return False
+                new_session = Session.load_or_create(
+                    jp2_path, grid, self.config.to_dict(), labels_dir,
+                    labeler=self.config.labeler or "unknown", resume=False,
+                )
+
+            # Commit the new session only after preprocessing is accepted, keeping
+            # the previous observation usable when opening is cancelled.
+            preprocess_dialog = PreprocessDialog(raster, grid, self.config.to_dict())
+            preprocess_dialog.start_preprocessing()
+            result = preprocess_dialog.exec()
+            preprocess_dialog.worker.wait()
+            if result != QDialog.DialogCode.Accepted:
+                self.status_label.setText("Loading cancelled")
+                return False
+
+            recovered = labels_dir != self.labels_dir
+            self.session = new_session
+            self.labels_dir = labels_dir
+            self.gsd_ratio = gsd_ratio
+            self.classes_scheme = classes_scheme
+            self._resolve_na_class()
             if previous_session:
                 previous_session.raster.close()
+
+            if self.predictions_mode:
+                self.display_layer = "classes"
+                self.block_confidence = {}
+                self.block_uncertainty = {}
+                self.uncertainty_button.setChecked(False)
+                self.uncertainty_button.setEnabled(False)
+                self.prediction_render_mode = "pixelwise"
+                self.block_pixel_predictions = {}
+                self.render_mode_button.setChecked(False)
+                self.render_mode_button.setText("Pixel-wise view")
+                self.render_mode_button.setEnabled(False)
 
             # A restored session carries the class NAMES that were current when it
             # was saved; class_id is authoritative, so re-derive them rather than
@@ -526,19 +788,6 @@ class MainWindow(QMainWindow):
 
             # Setup autosave timer
             self._setup_autosave()
-
-            # Show preprocessing dialog
-            preprocess_dialog = PreprocessDialog(raster, grid, self.config.to_dict())
-            preprocess_dialog.start_preprocessing()
-
-            result = preprocess_dialog.exec()
-            preprocess_dialog.worker.wait()
-            if result != QDialog.DialogCode.Accepted:
-                self.status_label.setText("Loading cancelled")
-                raster.close()
-                self.session.raster.close()
-                self.session = None
-                return
 
             # Store skip decisions for later use
             self.skip_decisions = preprocess_dialog.get_skip_decisions()
@@ -579,23 +828,34 @@ class MainWindow(QMainWindow):
             self.saved_complete_panels = set()
 
             self.status_label.setText(f"Loaded: {jp2_path.stem}")
+            if recovered:
+                self.status_label.setText(
+                    f"Opened without saved labels · New labels folder: {self.labels_dir}"
+                )
             # Only a real observation open schedules startup help. Rendering a
             # panel (including hidden test/review windows) must not open modals.
             if not self.help_shown_on_startup:
                 self.help_shown_on_startup = True
                 QTimer.singleShot(100, self._show_help)
+            return True
 
         except Exception as e:
             # Surface the failure instead of silently leaving a blank "(No session)"
             # window; keep the full traceback on stderr for debugging.
             traceback.print_exc()
             self.status_label.setText(f"Error: {str(e)}")
-            self.session = None
             QMessageBox.critical(
                 self,
                 "Could not load observation",
                 f"Failed to load {jp2_path.name}:\n\n{e}",
             )
+            return False
+        finally:
+            if raster is not None:
+                raster.close()
+            if new_session is not None and new_session is not self.session:
+                new_session.raster.close()
+            self._sync_workspace()
 
     # ------------------------------------------------------------------ #
     # Predictions mode (mars-inference): model-seeded session + explicit save
@@ -615,27 +875,32 @@ class MainWindow(QMainWindow):
         if not self.predictions_mode:
             raise RuntimeError("load_for_inference requires predictions_mode=True")
 
-        self.model_path = model_path
         model_id = model_path.stem
+        model_sig = self._model_signature(model_path)
+        previous_session = self.session
+        previous_settings = self.model_path, self.labels_dir, self.config.labeler
+        # The loader needs the requested model for its GSD check and cache folder,
+        # but a cancelled open must retain the previous session's save destination.
+        self.model_path = model_path
         self.labels_dir = Path(self.config.paths.predictions_dir) / model_id
         self.config.labeler = f"model:{model_id}"
-        self.setWindowTitle(f"Mars Obs Labeler — Predictions [{model_id}] — {jp2_path.name}")
+        obs_id = jp2_path.stem
+        if not self._load_observation(jp2_path):
+            if self.session is previous_session:
+                self.model_path, self.labels_dir, self.config.labeler = previous_settings
+            return  # failure/cancellation has already been reported
 
-        # Fresh observation -> analysis layers from any previous one are stale.
-        self.display_layer = "classes"
-        self.block_confidence = {}
-        self.block_uncertainty = {}
-        self.uncertainty_button.setChecked(False)
-        self.prediction_render_mode = "pixelwise"
-        self.block_pixel_predictions = {}
-        self.render_mode_button.setChecked(False)
-        self.render_mode_button.setText("\U0001F5FA Pixel-wise view")
+        self.setWindowTitle(f"Mars Obs Labeler — Predictions [{model_id}] — {jp2_path.name}")
         self.npca_gallery = self._try_load_npca_gallery(model_path)
         self.local_npca_gallery = {}
+        self._model_sig = None
 
-        model_sig = self._model_signature(model_path)
-        obs_id = jp2_path.stem
-        saved = Session.read_saved_metadata(self.labels_dir, obs_id)
+        # Inspect the cache only after loading has handled unreadable saved labels.
+        # Recovery uses a fresh folder, and --fresh must never read the old cache.
+        saved = (
+            Session.read_saved_metadata(self.labels_dir, obs_id)
+            if not self.ignore_cached_predictions else None
+        )
         cache_valid = (
             saved is not None
             and saved.get("model_sig") == model_sig
@@ -649,10 +914,6 @@ class MainWindow(QMainWindow):
                 "were made with a different version of this checkpoint file "
                 "(size/modified time differ). Re-running inference.",
             )
-
-        self._load_observation(jp2_path)
-        if not self.session:
-            return  # load failed or was cancelled; _load_observation already reported it
 
         self.save_predictions_button.setEnabled(True)
         self.uncertainty_button.setEnabled(True)
@@ -893,10 +1154,10 @@ class MainWindow(QMainWindow):
         renders the cached per-pixel crops instead -- see block_pixel_predictions)."""
         if self.render_mode_button.isChecked():
             self.prediction_render_mode = "blockwise"
-            self.render_mode_button.setText("\U0001F5FA Block-wise view")
+            self.render_mode_button.setText("Block-wise view")
         else:
             self.prediction_render_mode = "pixelwise"
-            self.render_mode_button.setText("\U0001F5FA Pixel-wise view")
+            self.render_mode_button.setText("Pixel-wise view")
         self._refresh_label_overlay()
 
     def _toggle_uncertainty_layer(self) -> None:
@@ -1050,6 +1311,7 @@ class MainWindow(QMainWindow):
         self.main_layout.setSizes(sizes)
         self._summary_page = view
         self._showing_summary = True
+        self.view_label.setText("CLASS SUMMARY   ·   COVERAGE & MODEL ANALYSIS")
         self.status_label.setText(
             f"Class Summary ({view.npca_source} Neural-PCA examples) "
             "-- press Summary again or Esc to return to the map"
@@ -1070,6 +1332,7 @@ class MainWindow(QMainWindow):
         # The canvas had no size while hidden, so re-apply the fit/zoom transform.
         if self.session:
             self.canvas.apply_zoom_view()
+        self._sync_workspace()
         self.status_label.setText("Ready")
 
     def _on_local_npca_clicked(self, block_id: str) -> None:
@@ -1161,8 +1424,7 @@ class MainWindow(QMainWindow):
                 f"Opening {imagery_path.name} (this may take a while for a large mosaic)..."
             )
             QApplication.processEvents()
-            self._load_observation(imagery_path)
-            if not self.session:
+            if not self._load_observation(imagery_path):
                 return  # load failed/cancelled; _load_observation already reported it
 
         block_idx = self.session.grid.block_index_at_pixel(col, row)
@@ -1206,6 +1468,18 @@ class MainWindow(QMainWindow):
         old_widget.deleteLater()
         self.main_layout.setSizes(sizes)
         self.legend_panel = legend
+        self._sync_legend_selection()
+
+    def _sync_legend_selection(self) -> None:
+        """Use the selected block's record, never the last-used paint class."""
+        if not isinstance(self.legend_panel, LegendPanel):
+            return
+        class_id = None
+        if self.session:
+            record = self.session.labels.get_record(self.session.current_block().block_id)
+            if record.status in ("labeled", "abstain"):
+                class_id = record.class_id
+        self.legend_panel.set_current_class(class_id)
 
     def _load_current_panel(self):
         """Load and display the panel the cursor is in (synchronous, decimated read)."""
@@ -1237,6 +1511,8 @@ class MainWindow(QMainWindow):
         """Render the given panel image and its overlays."""
         if not self.session:
             return
+
+        self._sync_workspace()
 
         # Display panel image
         self.canvas.set_panel_image(panel_data, stretch_percentiles=(1, 99))
@@ -1338,6 +1614,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_label_overlay(self) -> None:
         """Rebuild only the colored/heatmap block overlay (no raster re-read)."""
+        self._sync_legend_selection()
         if not self.session:
             return
         grid = self.session.grid
@@ -1691,6 +1968,8 @@ class MainWindow(QMainWindow):
         view is currently showing).
         """
         grid = self.session.grid
+        self._sync_workspace()
+        self.view_label.setText(f"OBSERVATION OVERVIEW   ·   {grid.num_panels} PANELS")
         pa, pd = grid.panels_across, grid.panels_down
         cell = 200
         self.canvas.zoom = 1
@@ -1756,6 +2035,8 @@ class MainWindow(QMainWindow):
         pa, pd = grid.panels_across, grid.panels_down
         bppr, bppc = grid.blocks_per_panel_row, grid.blocks_per_panel_col
         self.current_panel_idx = self.session.current_block().panel_idx
+        self._sync_workspace()
+        self.view_label.setText(f"REGIONAL VIEW   ·   {span} × {span} PANELS")
         cur_pr, cur_pc = divmod(self.current_panel_idx, pa)
 
         # Span-aligned region origin (in panels) containing the current panel
@@ -1815,6 +2096,7 @@ class MainWindow(QMainWindow):
 
     def _update_preview(self) -> None:
         """Refresh the side preview from the current block."""
+        self._sync_legend_selection()
         if not self.session:
             return
         cb = self.session.current_block()

@@ -13,7 +13,7 @@ from PIL import Image
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 from rasterio.transform import Affine
 
 from marslabeler.io.raster import RasterSource
@@ -22,6 +22,7 @@ from marslabeler.model.labelstore import LabelStore
 from marslabeler.model.session import Session
 from marslabeler.model.export import export_coarse_geotiff
 from marslabeler.ui.mainwindow import MainWindow
+from marslabeler.ui.legendpanel import ClassRow
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("export_labels", ROOT / "scripts/export_labels.py")
@@ -83,6 +84,88 @@ def press(win, key, modifier=Qt.KeyboardModifier.NoModifier):
     QApplication.processEvents()
 
 
+def assert_legend_class(win, class_id):
+    assert win.legend_panel.current_class_id == class_id
+    rows = win.legend_panel.findChildren(ClassRow)
+    assert {r._class_id for r in rows if r.property("currentClass")} == (
+        {class_id} if class_id is not None else set()
+    )
+    assert {r._class_id for r in rows if r.findChild(QLabel, "currentClassMarker").text()} == (
+        {class_id} if class_id is not None else set()
+    )
+
+
+def test_legend_tracks_current_block_through_editing_and_auto_advance(workflow):
+    win, *_ = workflow
+    win.activateWindow()
+    assert_legend_class(win, None)
+    press(win, Qt.Key_Q)
+    assert win.session.current_block_idx == 1
+    assert_legend_class(win, None)  # Follow the new block, not the last used class.
+    press(win, Qt.Key_Left)
+    assert_legend_class(win, 0)
+
+    row = next(r for r in win.legend_panel.findChildren(ClassRow) if r._class_id == 1)
+    QTest.mouseClick(row, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert win.session.current_block_idx == 0
+    assert_legend_class(win, 1)
+    assert QApplication.focusWidget() is win.canvas
+    press(win, Qt.Key_Space)
+    assert_legend_class(win, -1)
+    press(win, Qt.Key_Delete)
+    assert_legend_class(win, None)
+    press(win, Qt.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    assert_legend_class(win, -1)
+    press(win, Qt.Key_Z, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+    assert_legend_class(win, None)
+
+
+@pytest.mark.parametrize("view_mode", ["panel", "multi"])
+def test_legend_tracks_block_selection_and_panel_navigation(workflow, view_mode):
+    win, *_ = workflow
+    grid = win.session.grid
+    for idx, cid in ((0, 0), (1, 12), (grid.blocks_per_panel, 17)):
+        win.session.labels.assign(grid.get_block(idx).block_id, cid, win.classes_scheme.get_name(cid))
+    win._set_view(view_mode)
+    assert_legend_class(win, 0)
+    win.canvas.on_block_clicked(0, 1)
+    assert_legend_class(win, 12)
+    press(win, Qt.Key_Right)
+    assert_legend_class(win, None)
+    if view_mode == "multi":
+        win.canvas.on_block_clicked(0, grid.blocks_per_panel_col)
+    else:
+        win._on_panel_selected(1)
+    assert_legend_class(win, 17)
+    # Rebuilding the legend (e.g. loading a class scheme) preserves the selection.
+    win._update_legend_panel()
+    assert_legend_class(win, 17)
+    # A nodata block has no terrain class to highlight.
+    win.session.labels.set_nodata_bulk([win.session.current_block().block_id])
+    win._refresh_view()
+    assert_legend_class(win, None)
+
+
+@pytest.mark.parametrize("display_layer", ["labels", "uncertainty"])
+def test_legend_tracks_paint_and_selection_edits_without_moving_cursor(workflow, display_layer):
+    win, *_ = workflow
+    win.display_layer = display_layer
+    win.held_class_id = 11
+    win._on_block_paint(0, 0, True)
+    win._on_block_paint_end()
+    assert_legend_class(win, 11)
+    win.held_class_id = 12
+    win._on_block_paint(0, 1, True)
+    win._on_block_paint_end()
+    assert_legend_class(win, 11)  # Painting a neighbor must not select its class.
+    win.selection_rect = (0, 0, 0, 1)
+    win._fill_selection(12)
+    assert_legend_class(win, 12)
+    press(win, Qt.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    assert_legend_class(win, 11)
+
+
 def test_close_reopen_and_export_preserve_labels_and_native_crops(workflow):
     win, pixels, source, root, open_window = workflow
     # Different panels and clipped right/bottom edges; real names include commas.
@@ -129,6 +212,36 @@ def test_count_autosave_runs_on_action(workflow):
     path = root / "labels/OBS.parquet"
     assert path.exists(), "count autosave must not wait for the timer"
     assert sum(r["status"] == "labeled" for r in pq.read_table(path).to_pylist()) == 3
+
+
+def test_workspace_toolbar_returns_from_summary_and_saves_keyboard_labels(workflow):
+    win, _, source, root, _ = workflow
+    assert win.workspace_save_button.isEnabled()
+    assert not win.empty_workspace.isVisible()
+    assert win.observation_label.text() == source.stem
+    win._show_class_summary()
+    assert "CLASS SUMMARY" in win.view_label.text()
+    QTest.mouseClick(win.zoom_in_button, Qt.MouseButton.LeftButton)
+    QApplication.processEvents()
+    assert not win._showing_summary
+    assert win.canvas.isVisible()
+    assert win.canvas.zoom == 2
+    QTest.mouseClick(win.fit_button, Qt.MouseButton.LeftButton)
+    assert win.canvas.zoom == 1
+    assert win.view_mode == "panel"
+    # Clicking a toolbar control must leave class hotkeys with the canvas/window.
+    assert QApplication.focusWidget() not in (win.zoom_in_button, win.fit_button)
+    block_id = win.session.current_block().block_id
+    QTest.keyClick(QApplication.focusWidget() or win, Qt.Key_Q)
+    assert win.session.labels.get_record(block_id).class_id == 0
+    QTest.mouseClick(win.workspace_save_button, Qt.MouseButton.LeftButton)
+    saved = pq.read_table(root / "labels/OBS.parquet").to_pylist()
+    assert next(r for r in saved if r["block_id"] == block_id)["class_id"] == 0
+    win._toggle_overview()
+    win._show_class_summary()
+    win._close_class_summary()
+    assert win.view_mode == "overview"
+    assert "OBSERVATION OVERVIEW" in win.view_label.text()
 
 
 @pytest.mark.parametrize("action", ["paint", "selection", "undo"])

@@ -6,6 +6,15 @@ A fast, keyboard-driven GUI for block-level terrain labeling of HiRISE observati
 
 This tool enables rapid supervised labeling of Mars terrain features on gigapixel HiRISE scenes. The labeler views a large panel of imagery, presses a single key for each block's majority terrain class, and the cursor auto-advances to the next block. Minimal mouse movement and maximum keyboard speed are the core design goals.
 
+The desktop workspace uses a dark, imagery-centered layout inspired by
+[MMGIS](https://nasa-ammos.github.io/MMGIS/): observation and save controls in the
+header, panel navigation on the left, terrain classes beside the image, and a
+resizable block inspector with view and analysis controls on the right. It runs
+locally in PySide6 with the existing Python raster, labeling, and inference core.
+Open JP2 or GeoTIFF imagery from **Open observation** (or Ctrl/Cmd+O). The toolbar
+exposes zoom, **Fit panel**, and keyboard help; all labeling shortcuts remain
+available. The inspector shows native image crops scaled to its available width.
+
 **Spatial hierarchy:**
 - **Panel**: a large square region (default 4096×4096 px) shown one at a time
 - **Block**: the unit that gets a class label (default 512×512 px); a panel contains 8×8 = 64 blocks
@@ -80,7 +89,7 @@ What happens:
 1. **Preprocessing** — same nodata/skip-detection pass as `mars-label` (progress bar); off-swath blocks are never sent through the model.
 2. **Inference** — the checkpoint's model is reconstructed and run block-by-block over the observation, with a progress bar (`block N/M`). Each block gets one class: the model's per-pixel argmax, majority-voted across the block.
 3. **Review** — the window opens exactly like `mars-label`, with predicted blocks pre-colored by class. Relabel any block with the normal hotkeys; a block you edit gets `edit_count > 0` in the saved Parquet, so reviewed/edited predictions stay distinguishable from untouched model output.
-4. **Save Predictions** — press the "💾 Save Predictions" button to persist the current (possibly reviewed) predictions.
+4. **Save predictions** — press the header or sidebar's **Save predictions** button to persist the current (possibly reviewed) predictions.
 
 ### Caching
 
@@ -170,7 +179,7 @@ analysis code in `AI4ExoMars/vision_backend` (`uncertainty/` and `pc_align/`).
 
 ### Uncertainty Heatmap
 
-The **🌡 Uncertainty Heatmap** button (right panel, predictions mode only) swaps
+The **Uncertainty heatmap** button (right panel, predictions mode only) swaps
 the class-color overlay for a per-block heatmap (blue = confident, red =
 uncertain) of *epistemic* uncertainty — Mahalanobis distance from the model's
 feature representation to the nearest class's fitted Gaussian, a standard
@@ -187,7 +196,7 @@ artifact exists.
 
 ### Class Summary
 
-The Legend panel's **📊 Summary** button opens a per-class window with, for
+The Legend panel's **Class summary** button opens a per-class view with, for
 every configured class:
 
 - **Neural PCA gallery** — the top-activating image crops along each of the
@@ -206,9 +215,14 @@ every configured class:
 
 ### Open an observation
 1. Launch `mars-label`
-2. File → Open JP2 (or pass path on command line)
+2. Open observation, or File → Open observation (or pass path on command line)
 3. Observation loads; first panel displays
 4. Legend shows terrain classes; history panel lists all panels
+
+The current block's assigned class is highlighted in orange with a checkmark in
+the legend. It follows block navigation, label edits, and undo/redo, and scrolls
+into view when needed. Unlabeled and no-data blocks have no highlighted class;
+blocks marked Abstain highlight the Abstain row.
 
 ### Label blocks
 Press the **hotkey** for the majority terrain class in the current block:
@@ -265,6 +279,11 @@ When you reopen an observation:
 - Session resumes at last cursor position
 - All labels restored from Parquet
 - Class names refreshed from the current `classes.yaml`; keep class IDs stable
+
+If saved labels cannot be read or do not match the image, the warning offers
+**Open without saved labels**. The observation opens with a fresh session, and
+new labels save to the separate folder shown in the warning. Existing label
+files remain intact. **Cancel** keeps the current observation open.
 
 Saves atomically replace the Parquet file, embedding cursor, tile geometry, and
 source-image identity in the same snapshot. A missing or damaged JSON sidecar
