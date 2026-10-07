@@ -296,33 +296,100 @@ geometry and observation metadata.
 
 ## Export & Training
 
-### Export labeled blocks as probe set
+### Export crops and labels from the GUI
+
+Click **Export Labels** to save the current labels, including edits that have not
+been autosaved yet, as a new folder:
+
+```text
+exports/<observation>/dataset-<timestamp>/
+  crops/              # Native PNG image per labeled block
+  labels.csv          # Filename → class ID, target index, coordinates, dimensions
+  classes.json        # Complete, explicit class/target mapping
+  dataset.json        # Source identity, input scale, preprocessing, label origin
+  labels.parquet      # Full label snapshot, including unlabelled/abstained blocks
+  labels_coarse.tif    # GIS overview, one pixel per block
+  integrity.json      # SHA-256 checksums for the exported files
+  README.md           # Loading and verification instructions
+```
+
+Only blocks assigned a terrain class get a crop. Abstain, nodata, and unlabeled
+blocks are excluded. PNGs preserve native **uint8 or uint16** pixels exactly,
+including partial edge crops. Each label describes the whole block's majority
+terrain. The original observation is not needed to read the exported folder.
+
+Export runs with progress and cancellation. Every PNG is reopened and compared
+pixel-for-pixel with its source window, and the crop/label manifest is checked
+against the archived label snapshot before publishing. A failed or cancelled
+export leaves no partial dataset. Re-exporting makes a new timestamped folder;
+previous exports are preserved, and cleared labels cannot leave stale crops in
+the new dataset. The completion dialog shows the folder location.
+
+### Load the folder for block classification
+
+With PyTorch installed (`pip install -e '.[infer]'`):
+
+```python
+from torch.utils.data import DataLoader
+from marslabeler.model.cropdataset import BlockCropDataset
+
+dataset = BlockCropDataset("exports/OBS/dataset-<timestamp>")
+batch = next(iter(DataLoader(dataset, batch_size=8, shuffle=True)))
+images = batch["image"]     # [N, 1, block_size, block_size], float32 in [-1, 1]
+targets = batch["target"]   # [N], integer class indices
+# logits = classifier(images)  # [N, dataset.num_classes]
+# loss = torch.nn.functional.cross_entropy(logits, targets)
+```
+
+`class_id` retains the GUI's stable IDs. `target_index` is a contiguous mapping
+recorded in `classes.json`, independent of which classes appear in one export.
+The configured existing-model channel is recorded separately as `model_index`.
+The loader also returns `block_id`, `class_id`, `original_size`, and `valid_mask`.
+It checks each crop's checksum when reading it, pads edge crops on the right and
+bottom, and never resizes the terrain. Check class order and ground sampling
+scale when using a pretrained network; `num_classes=14` rejects exported targets
+outside a 14-class classifier head.
+
+The default input conversion is recorded in `dataset.json`: uint8 pixels are
+normalized to [-1, 1]; uint16 input first uses one observation-wide percentile
+stretch, matching the approximation used in `mars-inference`. This does not
+reproduce the original DRG training preprocessing. A custom `transform` can
+supply other intensity preprocessing while preserving crop geometry.
+
+This is a **whole-block classification dataset**. AI4ExoMars Stage-3 segmentation
+training still needs a deliberate adapter/loss for these block-level targets;
+the coarse GeoTIFF is not a ready-made segmentation target raster. Context-branch
+models also need surrounding imagery. Prediction-mode exports are marked
+`prediction_review` and may include unreviewed predictions; `edit_count` records
+edits, not scientific approval. Split train/validation data by observation or
+separated regions to avoid spatial leakage.
+
+### Verify a folder after copying it
+
+This requires no PyTorch and no original observation:
+
 ```bash
-python3 scripts/export_labels.py /path/to/file.jp2 labels/OBS_ID.parquet \
+python -m marslabeler.model.cropdataset /path/to/exported/folder
+```
+
+After reinstalling the package, the equivalent command is
+`mars-verify-export /path/to/exported/folder`. Verification fails on missing,
+changed, swapped, or extra files, invalid mappings, and disagreement between the
+CSV and archived labels.
+
+### Command-line crop export
+
+The CLI uses the same exporter and validations as the GUI:
+
+```bash
+python scripts/export_labels.py /path/to/file.jp2 labels/OBS_ID.parquet \
   -o probe_set/
 ```
 
-Generates:
-- `crops/` — PNG images (one per labeled block)
-- `labels.csv` — Block coordinates and class IDs
-- `classes.json` — Class metadata
-
-PNG crops preserve the source's native **uint8 or uint16** pixel values without
-display stretching. CSV class names are quoted correctly, including names with
-commas; rows also record crop filename, dimensions, and dtype. Export checks
-source identity, block coordinates, bounds, duplicate IDs, and class IDs before
-publishing a complete set. Choose a **new or empty output directory** for each
-export, so older crops cannot remain mixed with newer labels.
-
-This is a block-classification probe set. The coarse GeoTIFF uses class IDs
-unchanged (0-based), with 253=abstain, 254=nodata, 255=unlabeled. AI4ExoMars's
-Stage-3 segmentation loader instead expects 1-based raster labels with 0=ignore
-and uint8 imagery: do not feed the coarse display export directly into that
-loader without explicit label remapping and imagery preprocessing.
-
-### Export to GeoTIFF
-Use **Export Labels** to write the coarse-grid GeoTIFF, Parquet, and class metadata
-to `exports/<obs_id>/`. The GeoTIFF preserves the source CRS and affine alignment.
+Choose a new or empty output directory. The CLI includes crops, manifests,
+checksums, instructions, and the label snapshot; the GUI also includes the coarse
+GeoTIFF. The coarse encoding stays unchanged: 0-based class IDs, 253=abstain,
+254=nodata, 255=unlabeled.
 
 ### Verify the complete workflow on an observation
 
@@ -334,9 +401,10 @@ QT_QPA_PLATFORM=offscreen python scripts/verify_labeling_workflow.py observation
 ```
 
 This drives real Qt tile clicks and hotkeys, autosave, clear/undo/redo, close and
-reopen, and export. It compares all six exported crops pixel-for-pixel to the
-source, checks CSV/GeoTIFF alignment, and runs a shuffled CPU PyTorch training
-batch with a backward/optimizer step. It writes screenshots, a contact sheet,
+reopen, and the actual **Export Labels** button. It copies the resulting folder,
+verifies its integrity, compares all six crops pixel-for-pixel to the source,
+checks CSV/GeoTIFF alignment, and uses `BlockCropDataset` for a shuffled CPU
+classification batch with a backward/optimizer step. It writes screenshots, a contact sheet,
 and `verification.json`. Trial labels are mechanical QA examples, **not scientific
 annotations**, and are isolated in the new output directory.
 

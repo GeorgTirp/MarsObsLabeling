@@ -35,6 +35,7 @@ infer = [
 [project.scripts]
 mars-label = "marslabeler.app:main"
 mars-inference = "marslabeler.inference_app:main"
+mars-verify-export = "marslabeler.model.cropdataset:main"
 
 [tool.black]
 line-length = 100

@@ -8,6 +8,8 @@ import argparse
 import csv
 import hashlib
 import json
+import os
+import shutil
 from pathlib import Path
 import sys
 import time
@@ -21,12 +23,11 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 import yaml
 
 from marslabeler.ui.mainwindow import MainWindow
-from marslabeler.model.export import export_coarse_geotiff
-from export_labels import export_probe_set
+from marslabeler.model.cropdataset import BlockCropDataset
 
 
 def run(source, output):
@@ -108,14 +109,29 @@ def run(source, output):
     for bid, cid in expected.items():
         assert resumed.session.labels.get_record(bid).class_id == cid
     resumed.grab().save(str(output / 'gui_reopened.png'))
-    parquet = output / 'labels' / f'{grid.obs_id}.parquet'
-    export_probe_set(source, parquet, Path(config['paths']['classes_file']), output / 'probe')
-    export_coarse_geotiff(resumed.session.labels, resumed.session.grid, output / 'coarse.tif')
+    from unittest.mock import patch
+
+    print('Clicking the actual GUI Export Labels button...', flush=True)
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(output)
+        with patch.object(QMessageBox, 'information', lambda *args: None), \
+             patch.object(QMessageBox, 'warning', lambda *args: errors.append(args[2])):
+            QTest.mouseClick(resumed.export_button, Qt.MouseButton.LeftButton)
+            app.processEvents()
+    finally:
+        os.chdir(previous_cwd)
+    assert not errors, errors
+    gui_export = resumed.last_export_path
+    # Exercise the portable copied folder, not only files at the original path.
+    shutil.copytree(gui_export, output / 'probe')
+    dataset = BlockCropDataset(output / 'probe')
+    integrity_result = dataset.validate()
     with (output / 'probe/labels.csv').open(newline='') as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == len(expected) == len(list((output / 'probe/crops').glob('*.png')))
     checks = []
-    with rasterio.open(source) as raster, rasterio.open(output / 'coarse.tif') as coarse:
+    with rasterio.open(source) as raster, rasterio.open(output / 'probe/labels_coarse.tif') as coarse:
         coarse_data = coarse.read(1)
         for row in rows:
             assert None not in row, row
@@ -137,21 +153,12 @@ def run(source, output):
                                max_absolute_pixel_error=0))
     print('All six crops match the source exactly; CSV and GeoTIFF ids agree.', flush=True)
 
-    class ProbeDataset(Dataset):
-        def __len__(self):
-            return len(rows)
-        def __getitem__(self, index):
-            row = rows[index]
-            with Image.open(output / 'probe/crops' / row['crop_filename']) as image:
-                raw = np.asarray(image).copy()
-            tensor = torch.from_numpy(raw.astype(np.float32) / np.iinfo(raw.dtype).max)[None, None]
-            tensor = F.interpolate(tensor, size=(64, 64), mode='bilinear', align_corners=False)[0]
-            return tensor, int(row['class_id']), row['block_id']
-
     torch.manual_seed(0)
-    loader = DataLoader(ProbeDataset(), batch_size=6, shuffle=True,
+    loader = DataLoader(dataset, batch_size=6, shuffle=True,
                         generator=torch.Generator().manual_seed(0))
-    images, labels, ids = next(iter(loader))
+    batch = next(iter(loader))
+    images, labels, ids = batch['image'], batch['target'], batch['block_id']
+    assert images.min() >= -1 and images.max() <= 1
     assert labels.tolist() == [expected[bid] for bid in ids]
     model = torch.nn.Sequential(torch.nn.Conv2d(1, 8, 3, padding=1), torch.nn.ReLU(),
                                 torch.nn.AdaptiveAvgPool2d(1), torch.nn.Flatten(),
@@ -184,10 +191,10 @@ def run(source, output):
     report = {'source': str(source), 'source_fingerprint': resumed.session.raster.fingerprint(),
               'note': 'Mechanical QA labels only, not scientific terrain annotations.',
               'labels_verified': 6, 'workflow': ['GUI click', 'class hotkey', 'count autosave',
-              'clear', 'undo', 'redo', 'edit', 'close save', 'reopen', 'CSV/PNG export',
+              'clear', 'undo', 'redo', 'edit', 'close save', 'reopen', 'actual GUI Export Labels click', 'copied-folder integrity verification',
               'exact source pixel comparison', 'GeoTIFF position/class check',
               'shuffled PyTorch batch', 'backward and optimizer step'],
-              'crop_checks': checks, 'training_batch_shape': list(images.shape),
+              'gui_export': str(gui_export), 'integrity': integrity_result, 'crop_checks': checks, 'training_batch_shape': list(images.shape),
               'training_labels': labels.tolist(), 'training_loss': float(loss.detach()),
               'elapsed_seconds': time.monotonic() - started}
     (output / 'verification.json').write_text(json.dumps(report, indent=2))

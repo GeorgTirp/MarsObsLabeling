@@ -42,7 +42,6 @@ from marslabeler.ui.preprocessdialog import PreprocessDialog
 from marslabeler.ui.helpdialog import HelpDialog
 from marslabeler.ui.loadingoverlay import LoadingOverlay
 from marslabeler.ui.theme import apply_theme
-from marslabeler.model.export import export_coarse_geotiff, export_class_metadata
 
 
 class MainWindow(QMainWindow):
@@ -2295,24 +2294,62 @@ class MainWindow(QMainWindow):
             self.history_panel.refresh()
 
     def _export(self) -> None:
-        """Export labels to exports/<obs_id>/ (coarse GeoTIFF + parquet + classes)."""
+        """Publish a fresh crop/label dataset from the current in-memory labels."""
         if not self.session:
+            return
+        import tempfile
+        from dataclasses import asdict
+
+        import yaml
+        from marslabeler.ui.exportdialog import ExportDialog
+
+        if self.session.labels.count_labeled() == 0:
+            self.status_label.setText("Nothing to export: assign a terrain class to at least one block.")
             return
         try:
             obs_id = self.session.grid.obs_id
-            # The exported Parquet must carry the same source identity as saves.
             self.session.raster.validate_fingerprint(self.session.labels.metadata.get("source"))
             self.session.labels.metadata["source"] = self.session.raster.fingerprint()
-            out_dir = Path("exports") / obs_id
-            out_dir.mkdir(parents=True, exist_ok=True)
-
-            self.session.labels.save_parquet(out_dir / f"{obs_id}_labels.parquet")
-            export_coarse_geotiff(
-                self.session.labels, self.session.grid, out_dir / f"{obs_id}_coarse.tif"
+            # Never merge a new dataset with old crops, even after labels are cleared.
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            out_dir = (Path("exports") / obs_id / f"dataset-{stamp}").resolve()
+            with tempfile.TemporaryDirectory(prefix="mars-export-") as temporary:
+                snapshot = Path(temporary) / "labels.parquet"
+                self.session.labels.save_parquet(snapshot)
+                scheme = self.classes_scheme
+                classes_path = Path(temporary) / "classes.yaml"
+                classes_path.write_text(yaml.safe_dump({
+                    "classes": [asdict(c) for c in scheme.classes.values()],
+                    "abstain": asdict(scheme.abstain), "nodata": asdict(scheme.nodata),
+                }), encoding="utf-8")
+                dialog = ExportDialog(
+                    self.session.raster.path, snapshot, classes_path, out_dir,
+                    self.session.grid, self.predictions_mode, self,
+                )
+                # Start after exec enters its event loop, so a fast failure cannot
+                # finish the dialog before it is shown.
+                QTimer.singleShot(0, dialog.worker.start)
+                try:
+                    result = dialog.exec()
+                finally:
+                    if dialog.worker.isRunning():
+                        dialog.worker.requestInterruption()
+                    dialog.worker.wait()
+                if dialog.worker.error:
+                    raise RuntimeError(dialog.worker.error)
+                if result != QDialog.DialogCode.Accepted:
+                    self.status_label.setText("Export cancelled. No dataset was published.")
+                    return
+                self.last_export_path = out_dir
+                count = dialog.worker.count
+            self.status_label.setText(f"Exported {count:,} crop/label pairs to {out_dir}")
+            self.status_label.setToolTip(str(out_dir))
+            QMessageBox.information(
+                self, "Export complete",
+                f"Exported and verified {count:,} crop/label pairs.\n\n{out_dir}\n\n"
+                "The folder includes native image crops, labels.csv, class definitions, "
+                "and loading instructions. Each label describes a whole block.",
             )
-            export_class_metadata(
-                self.session.labels, self.classes_scheme, out_dir / "classes.json"
-            )
-            self.status_label.setText(f"Exported to {out_dir}/")
         except Exception as e:
             self.status_label.setText(f"Export error: {str(e)}")
+            QMessageBox.warning(self, "Export failed", str(e))
