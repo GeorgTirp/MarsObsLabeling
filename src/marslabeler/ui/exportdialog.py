@@ -1,5 +1,6 @@
 """Cancellable crop export using a separate raster reader in a worker thread."""
 
+import traceback
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QProgressBar, QVBoxLayout
 
@@ -43,6 +44,7 @@ class ExportWorker(QThread):
             self.cancelled = True
         except Exception as exc:
             self.error = str(exc)
+            traceback.print_exc()
 
 
 class ExportDialog(QDialog):

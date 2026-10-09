@@ -1,12 +1,32 @@
 """Test fixtures."""
 
 import tempfile
+import errno
+import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 import rasterio
 from rasterio.transform import Affine, from_bounds
+
+
+@pytest.fixture
+def windows_flush_semantics(monkeypatch):
+    """Require a writable fsync descriptor, like Windows, on every test OS."""
+    real_fsync = os.fsync
+    calls = []
+
+    def writable_fsync(fd):
+        try:
+            os.write(fd, b"")  # No bytes changed; read-only descriptors fail.
+        except OSError as exc:
+            raise OSError(errno.EBADF, "Bad file descriptor") from exc
+        calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", writable_fsync)
+    return calls
 
 
 @pytest.fixture

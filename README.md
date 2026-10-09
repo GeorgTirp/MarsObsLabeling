@@ -265,6 +265,11 @@ Blocks auto-advance to the next unlabeled block in reading order.
 
 ## Persistence & Resume
 
+**Windows `[Errno 9] Bad file descriptor` while labels are still visible:** keep
+the app open and follow the [live-session rescue instructions](docs/windows-save-recovery.md)
+before restarting to install the fix. They preserve the current snapshot in a
+separate folder and verify it before reopening.
+
 Every labeling action triggers autosave checks:
 - **By label count**: every `autosave.every_n_labels` actions (default 25)
 - **By time**: every `autosave.every_seconds` seconds (default 30)
@@ -274,6 +279,9 @@ autosave. **File → Save Labels** (`Ctrl+S` / `Cmd+S`) saves immediately. Closi
 the window or opening another observation saves the current labeling session;
 if saving fails, closing/switching is stopped so the edits remain available.
 Prediction sessions retain their explicit **Save Predictions** workflow.
+Successful saves show a persistent labeled-block count, time, and destination
+tooltip. A save failure opens an error dialog and leaves a visible failure
+indicator; autosave errors are never confined to transient navigation messages.
 
 When you reopen an observation:
 - Session resumes at last cursor position

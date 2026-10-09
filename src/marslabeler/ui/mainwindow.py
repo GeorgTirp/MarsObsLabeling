@@ -80,6 +80,7 @@ class MainWindow(QMainWindow):
         # thumbnail click can navigate this window while the summary stays
         # open and visible alongside it.
         self._summary_dialog = None
+        self._save_failure_notified = False
 
         # Analysis layers (mars-inference): which overlay the canvas is showing, and
         # the per-block data behind it. All empty/None until inference actually runs
@@ -306,6 +307,8 @@ class MainWindow(QMainWindow):
         self.status_label.setMinimumWidth(0)
         self.status_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.statusBar.addWidget(self.status_label, 1)
+        self.save_feedback_label = QLabel("")
+        self.statusBar.addPermanentWidget(self.save_feedback_label)
         self.statusBar.addPermanentWidget(QLabel("LOCAL WORKSPACE"))
 
     @staticmethod
@@ -364,7 +367,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self._workspace_button("Open observation", self._on_open_file))
         self.workspace_save_button = self._workspace_button(
             "Save predictions" if self.predictions_mode else "Save labels",
-            lambda: self._save_predictions() if self.predictions_mode else self._autosave_session(),
+            lambda: self._save_predictions() if self.predictions_mode else self._autosave_session(note="manual"),
             primary=True,
         )
         self.workspace_save_button.setEnabled(False)
@@ -484,7 +487,7 @@ class MainWindow(QMainWindow):
         self.save_action = QAction("Save Labels", self)
         self.save_action.setShortcut(QKeySequence.StandardKey.Save)
         self.save_action.triggered.connect(
-            lambda: self._save_predictions() if self.predictions_mode else self._autosave_session()
+            lambda: self._save_predictions() if self.predictions_mode else self._autosave_session(note="manual")
         )
         file_menu.addAction(self.save_action)
 
@@ -529,6 +532,10 @@ class MainWindow(QMainWindow):
             return
 
         self.labels_dir = Path(path)
+        self.workspace_save_button.setText("Save predictions" if self.predictions_mode else "Save labels")
+        self.save_feedback_label.setText("Save to the new folder to keep current edits")
+        self.save_feedback_label.setToolTip(str(self.labels_dir.resolve()))
+        self.workspace_save_button.setToolTip(str(self.labels_dir.resolve()))
         if self.session is not None:
             # A session is already open; saves now target the new folder. It does not
             # retroactively pull in labels there — reopen the image to resume those.
@@ -747,6 +754,11 @@ class MainWindow(QMainWindow):
             recovered = labels_dir != self.labels_dir
             self.session = new_session
             self.labels_dir = labels_dir
+            self._save_failure_notified = False
+            self.workspace_save_button.setText("Save predictions" if self.predictions_mode else "Save labels")
+            self.workspace_save_button.setToolTip(str(self.labels_dir.resolve()))
+            self.save_feedback_label.setText("")
+            self.save_feedback_label.setToolTip("")
             self.gsd_ratio = gsd_ratio
             self.classes_scheme = classes_scheme
             self._resolve_na_class()
@@ -1121,9 +1133,9 @@ class MainWindow(QMainWindow):
                 "model_stem": self.model_path.stem if self.model_path else None,
             }
             self.session.save_session(self.labels_dir, extra_meta=extra_meta)
-            self.status_label.setText(f"Predictions saved to {self.labels_dir}")
+            self._show_saved_feedback()
         except Exception as e:
-            self.status_label.setText(f"Save error: {str(e)}")
+            self._show_save_failure(e)
 
     def _try_load_npca_gallery(self, model_path: Path) -> Optional[dict]:
         """Load the model's neural-PCA gallery sidecar, if one has been fitted yet.
@@ -1829,6 +1841,9 @@ class MainWindow(QMainWindow):
 
     def _on_labels_changed(self) -> None:
         """Callback: labels have changed, refresh the active view."""
+        if not self._save_failure_notified:
+            self.workspace_save_button.setText("Save predictions" if self.predictions_mode else "Save labels")
+            self.save_feedback_label.setText("Unsaved changes")
         prev_panel = self.current_panel_idx  # panel the just-labeled block was in
         self._refresh_view()  # panel mode re-syncs current_panel_idx to the cursor
         self._refresh_history()
@@ -2128,12 +2143,7 @@ class MainWindow(QMainWindow):
         if self.predictions_mode or not self.session:
             return
 
-        try:
-            self.session.save_session(self.labels_dir)
-            self.controller.reset_autosave()
-            self.status_label.setText(f"Auto-saved (panel {self.current_panel_idx})")
-        except Exception as e:
-            self.status_label.setText(f"Autosave error: {str(e)}")
+        self._autosave_session(note=f"automatic, panel {self.current_panel_idx}")
 
     def _show_help(self) -> None:
         """Show keyboard shortcuts help dialog."""
@@ -2205,17 +2215,49 @@ class MainWindow(QMainWindow):
             self.session.save_session(self.labels_dir)
             if self.controller:
                 self.controller.reset_autosave()
-            msg = "Saved" if not note else f"Saved ({note})"
-            self.status_label.setText(msg)
+            self._show_saved_feedback(note)
             return True
         except Exception as e:
-            self.status_label.setText(f"Save error: {str(e)}")
+            self._show_save_failure(e, force_notice=note == "manual")
             return False
+
+    def _show_saved_feedback(self, note: str = "") -> None:
+        """Keep the last successful save visible even when navigation changes status."""
+        path = (self.labels_dir / f"{self.session.grid.obs_id}.parquet").resolve()
+        count = self.session.labels.count_labeled()
+        stamp = datetime.now().strftime("%H:%M:%S")
+        message = f"Saved {count:,} labeled blocks at {stamp} to {path}"
+        if note:
+            message += f" ({note})"
+        self._save_failure_notified = False
+        self.workspace_save_button.setText(f"Saved {stamp}")
+        self.workspace_save_button.setToolTip(message)
+        self.save_feedback_label.setText(f"{count:,} labeled blocks saved · {stamp}")
+        self.save_feedback_label.setToolTip(str(path))
+        self.status_label.setText(message)
+        self.status_label.setToolTip(message)
+
+    def _show_save_failure(self, error: Exception, *, force_notice: bool = False) -> None:
+        traceback.print_exc()
+        message = (
+            f"Could not save to {self.labels_dir.resolve()}:\n{error}\n\n"
+            "Your current edits are still in this window. Keep it open until saving succeeds. "
+            "You can choose a writable local folder with File → Set Labels Folder, "
+            "then press Save again."
+        )
+        self.workspace_save_button.setText("Save failed — retry")
+        self.workspace_save_button.setToolTip(message)
+        self.save_feedback_label.setText("SAVE FAILED · edits remain in memory")
+        self.save_feedback_label.setToolTip(message)
+        self.status_label.setText(f"Save error: {error}")
+        # Autosave must not silently fail, or open another dialog every 30 seconds.
+        if force_notice or not self._save_failure_notified:
+            self._save_failure_notified = True
+            QMessageBox.critical(self, "Could not save labels", message)
 
     def closeEvent(self, event) -> None:
         """Persist the last edits/cursor before releasing the observation."""
         if not self._autosave_session(note="on close"):
-            QMessageBox.critical(self, "Could not save labels", self.status_label.text())
             event.ignore()
             return
         if self.autosave_timer:
@@ -2352,4 +2394,5 @@ class MainWindow(QMainWindow):
             )
         except Exception as e:
             self.status_label.setText(f"Export error: {str(e)}")
+            traceback.print_exc()
             QMessageBox.warning(self, "Export failed", str(e))

@@ -14,7 +14,11 @@ def atomic_output(path: Path):
     temporary = Path(name)
     try:
         yield temporary
-        with temporary.open("rb") as stream:
+        # Windows FlushFileBuffers (used by os.fsync) requires write access.
+        # Opening read-only works on POSIX but raises EBADF on Windows, breaking
+        # both session saves and export snapshots before they can be published.
+        # r+b preserves the completed contents; wb would truncate them.
+        with temporary.open("r+b") as stream:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
