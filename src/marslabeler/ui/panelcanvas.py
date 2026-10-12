@@ -61,6 +61,8 @@ class PanelCanvas(QGraphicsView):
         # Marquee selection finished: (r0, c0, r1, c1) inclusive block range
         self.on_selection_made: Optional[Callable[[int, int, int, int], None]] = None
         self._last_paint_cell: Optional[tuple[int, int]] = None
+        self.paint_enabled = True
+        self._paint_stroke = False
 
         # Shift+drag marquee selection state
         self._selecting = False
@@ -273,6 +275,9 @@ class PanelCanvas(QGraphicsView):
 
     def mousePressEvent(self, event) -> None:
         """Shift+drag = marquee selection; plain = navigate + start paint stroke."""
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
         block_row, block_col = self._block_at(event.pos())
         self._last_paint_cell = (block_row, block_col)
 
@@ -285,10 +290,13 @@ class PanelCanvas(QGraphicsView):
             return
 
         self._selecting = False
+        # Capture before navigation: an overview click can open a panel, but
+        # that same click must not start erasing/painting the newly opened panel.
+        self._paint_stroke = self.paint_enabled
         if self.on_block_clicked:
             self.on_block_clicked(block_row, block_col)
         # Begin a potential drag-paint stroke (handler no-ops if no class is held)
-        if self.on_block_paint:
+        if self._paint_stroke and self.on_block_paint:
             self.on_block_paint(block_row, block_col, True)
 
     def mouseMoveEvent(self, event) -> None:
@@ -306,12 +314,24 @@ class PanelCanvas(QGraphicsView):
 
         cell = (block_row, block_col)
         if cell != self._last_paint_cell:
+            previous = self._last_paint_cell
             self._last_paint_cell = cell
-            if self.on_block_paint:
-                self.on_block_paint(block_row, block_col, False)
+            if self._paint_stroke and self.on_block_paint and previous is not None:
+                # Fast mouse motion can cross several cells between events.
+                # Visit the intervening cells so paint/erase strokes have no gaps.
+                dr, dc = block_row - previous[0], block_col - previous[1]
+                steps = max(abs(dr), abs(dc))
+                for step in range(1, steps + 1):
+                    self.on_block_paint(
+                        previous[0] + round(dr * step / steps),
+                        previous[1] + round(dc * step / steps), False,
+                    )
 
     def mouseReleaseEvent(self, event) -> None:
         """Finalize the marquee selection, or end a drag-paint stroke."""
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
         if self._selecting and self._sel_anchor is not None:
             block_row, block_col = self._block_at(event.pos())
             r0, r1 = sorted((self._sel_anchor[0], block_row))
@@ -319,11 +339,13 @@ class PanelCanvas(QGraphicsView):
             self.set_selection_rect(r0, c0, r1, c1)  # keep it highlighted
             self._selecting = False
             self._sel_anchor = None
+            self._last_paint_cell = None
             if self.on_selection_made:
                 self.on_selection_made(r0, c0, r1, c1)
             return
 
         self._last_paint_cell = None
+        self._paint_stroke = False
         if self.on_block_paint_end:
             self.on_block_paint_end()
 

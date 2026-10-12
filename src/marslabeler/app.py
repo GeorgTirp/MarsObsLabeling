@@ -57,7 +57,7 @@ def main():
         ]
         config_path = next((p for p in potential_paths if p.exists()), Path("configs/app.yaml"))
     window = MainWindow(config_path, resolution_m=args.resolution)
-    window.show()
+    window.showMaximized()
 
     if args.jp2_path:
         window._load_observation(Path(args.jp2_path))

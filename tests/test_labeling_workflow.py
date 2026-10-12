@@ -137,6 +137,10 @@ def test_legend_tracks_block_selection_and_panel_navigation(workflow, view_mode)
         win.canvas.on_block_clicked(0, grid.blocks_per_panel_col)
     else:
         win._on_panel_selected(1)
+        assert win.session.current_block_idx == grid.blocks_per_panel + 1
+        assert_legend_class(win, None)
+        # A direct block click still permits reviewing an existing label.
+        win.canvas.on_block_clicked(0, 0)
     assert_legend_class(win, 17)
     # Rebuilding the legend (e.g. loading a class scheme) preserves the selection.
     win._update_legend_panel()

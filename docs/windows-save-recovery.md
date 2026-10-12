@@ -1,6 +1,7 @@
 # Windows Save / Export failure: preserve the open session first
 
-Keep the existing app open. Do not restart it, reopen the observation, or choose
+Keep the existing app and its PowerShell window open. Closing PowerShell can
+terminate the app without saving. Do not restart the app, reopen the observation, or choose
 "Open without saved labels" while the latest work exists only in that window.
 Updating Python source files does not update the functions already loaded in a
 running process. A restart to pick up the fix must come **after** recovery.
@@ -18,7 +19,7 @@ format and does not require restarting or reinstalling the running app.
    ```
 
    If Python is not activated, use the app environment's interpreter, for example
-   `.env\Scripts\python.exe scripts\rescue_open_session.py`.
+   `.\venv\Scripts\python.exe scripts\rescue_open_session.py`.
 
 2. The helper creates a **new** folder under your Windows home directory's
    `MarsLabelRescue` folder. It configures delete protection on its `capture`

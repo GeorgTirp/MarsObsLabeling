@@ -65,10 +65,12 @@ def test_move_to_block(test_session):
 
 
 def test_move_to_panel(test_session):
-    """Test moving to a panel."""
+    """Panel entry skips the synthetic image's four leading no-data blocks."""
     test_session.move_to_panel(0)
     assert test_session.current_panel_idx() == 0
-    assert test_session.current_block_idx == 0
+    assert test_session.current_block_idx == 4
+    assert all(test_session.labels.get_record(test_session.grid.get_block(i).block_id).status == "nodata"
+               for i in range(4))
 
 
 def test_label_current_block(test_session):

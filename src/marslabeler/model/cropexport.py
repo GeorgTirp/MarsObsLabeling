@@ -1,10 +1,12 @@
 """Portable image/whole-block-label datasets shared by GUI and CLI exports."""
 
 import csv
+import hashlib
 import json
 import shutil
 import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import pyarrow.parquet as pq
@@ -15,11 +17,77 @@ from marslabeler.classes import load_classes
 from marslabeler.io.raster import RasterSource
 from marslabeler.inference.engine import compute_global_quantization
 from marslabeler.model.labelstore import LabelStore
-from marslabeler.model.dataset_integrity import write_integrity
+from marslabeler.model.dataset_integrity import file_sha256, read_integrity, verify_file, write_integrity
 
 
 class ExportCancelled(Exception):
     """A cancelled export never publishes a partial dataset."""
+
+
+@dataclass(frozen=True)
+class ExportCache:
+    """Trusted receipts retained in memory after a successfully verified export."""
+
+    folder: Path
+    signature: str
+    source_key: str
+    bounds: tuple[float, float] | None
+    extents: dict[str, tuple[int, int, int, int]]
+    checksums: dict[str, str]
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    folder: Path
+    count: int
+    created: int
+    reused: int
+    unchanged: bool
+    cache: ExportCache
+
+
+def _signature(value) -> str:
+    digest = hashlib.sha256()
+    for piece in json.JSONEncoder(sort_keys=True).iterencode(value):
+        digest.update(piece.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _existing_export_intact(cache: ExportCache, check_cancelled) -> bool:
+    """Check against in-memory receipts, even if disk manifests were rehashed."""
+    try:
+        actual = {p.relative_to(cache.folder).as_posix()
+                  for p in cache.folder.rglob("*") if p.is_file()}
+        if actual != set(cache.checksums):
+            return False
+        for name in cache.checksums:
+            check_cancelled()
+            verify_file(cache.folder, cache.checksums, name)
+        # Every byte matches the previously decoded/validated dataset. Repeating
+        # PNG decoding and label validation cannot add evidence to this check.
+    except (OSError, ValueError, KeyError):
+        return False
+    return True
+
+
+def _copy_verified_crop(cache: ExportCache, row: dict, destination: Path) -> bool:
+    extent = tuple(row[k] for k in ("x_px", "y_px", "w_px", "h_px"))
+    if cache.extents.get(row["block_id"]) != extent:
+        return False
+    name = f"crops/{row['block_id']}.png"
+    try:
+        source = verify_file(cache.folder, cache.checksums, name)
+    except (OSError, ValueError):
+        return False
+    try:
+        # Independent copies: editing/deleting an older export cannot alter the
+        # new one. Do not hard-link training data across snapshot folders.
+        shutil.copyfile(source, destination)
+    except FileNotFoundError:
+        return False  # An older export may have been moved during this export.
+    if file_sha256(destination) != cache.checksums[name]:
+        return False  # Changed during copy; regenerate from the original raster.
+    return True
 
 
 def export_probe_set(
@@ -34,6 +102,27 @@ def export_probe_set(
     prepare_archives: Callable[[Path], None] | None = None,
     label_origin: str = "unspecified",
 ) -> int:
+    """Backward-compatible CLI/API: export a fresh dataset and return its count."""
+    return export_crop_dataset(
+        jp2_path, parquet_path, classes_yaml, output_dir, min_confidence,
+        progress_cb=progress_cb, should_cancel=should_cancel,
+        prepare_archives=prepare_archives, label_origin=label_origin,
+    ).count
+
+
+def export_crop_dataset(
+    jp2_path: Path,
+    parquet_path: Path,
+    classes_yaml: Path,
+    output_dir: Path,
+    min_confidence: float = 0.0,
+    *,
+    progress_cb: Callable[[int, int], None] | None = None,
+    should_cancel: Callable[[], bool] | None = None,
+    prepare_archives: Callable[[Path], None] | None = None,
+    label_origin: str = "unspecified",
+    reuse: ExportCache | None = None,
+) -> ExportResult:
     """
     Export labeled blocks as crops for training (probe set per Model v2 §6.1).
 
@@ -44,8 +133,10 @@ def export_probe_set(
         output_dir: Output directory for crops
         min_confidence: Legacy parameter; only 0 is supported (no measured confidence).
 
-    Returns the number of exported crop/label pairs. An error or cancellation
-    leaves no partial output dataset and never overwrites a nonempty folder.
+    Reuse only receipts from a previous successful call in this session. Unchanged
+    labels return that verified folder; changed labels publish a complete new
+    folder, copying intact matching crops instead of decoding/encoding again.
+    An error or cancellation never publishes a partial output dataset.
     """
     def check_cancelled():
         if should_cancel is not None and should_cancel():
@@ -114,17 +205,44 @@ def export_probe_set(
             raise ValueError("No labeled blocks to export. Assign a terrain class to at least one block.")
         if progress_cb:
             progress_cb(0, len(labeled))
-        # Store one shared input mapping, never stretch each crop independently.
-        bounds = None
-        if raster.dtype != "uint8":
-            bounds = compute_global_quantization(raster, raster.width, raster.height)
-        check_cancelled()
         classes = [
             {"id": cid, "name": c.name, "color": c.color, "target_index": index,
              "model_index": c.model_index if c.model_index is not None else cid}
             for index, (cid, c) in enumerate(sorted(classes_scheme.classes.items()))
         ]
         targets = {c["id"]: c["target_index"] for c in classes}
+        block_size = metadata.get("block_size") or max(
+            max(r["w_px"], r["h_px"]) for r in labeled
+        )
+        source_key = _signature({"source": source_identity, "block_size": block_size,
+                                 "dtype": raster.dtype, "nodata": raster.nodata})
+        if reuse is not None and reuse.source_key != source_key:
+            reuse = None
+        # Cursor position and autosave timestamps are not dataset edits. All
+        # actual label records (including cleared blocks), classes and provenance
+        # participate, so relabels, renames, and review-mode changes are retained.
+        signature = _signature({
+            "rows": sorted(rows, key=lambda row: row["block_id"]),
+            "classes": classes, "source": source_key, "origin": label_origin,
+            "metadata": {k: v for k, v in metadata.items()
+                         if k not in ("current_block_idx", "timestamp")},
+            "archives": prepare_archives is not None,
+        })
+        check_cancelled()
+        if (reuse is not None and reuse.signature == signature
+                and _existing_export_intact(reuse, check_cancelled)):
+            raster.validate_fingerprint(source_identity)
+            check_cancelled()
+            if progress_cb:
+                progress_cb(len(labeled), len(labeled))
+            check_cancelled()
+            return ExportResult(reuse.folder, len(labeled), 0, len(labeled), True, reuse)
+        # Store one shared input mapping, never stretch each crop independently.
+        bounds = reuse.bounds if reuse is not None else None
+        if raster.dtype != "uint8" and reuse is None:
+            bounds = compute_global_quantization(raster, raster.width, raster.height)
+        check_cancelled()
+        created = reused = 0
 
         # Publish a complete set only after every crop and all manifests succeed.
         output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -140,16 +258,18 @@ def export_probe_set(
                 for count, row in enumerate(labeled, 1):
                     check_cancelled()
                     x, y, w, h = (row[k] for k in ("x_px", "y_px", "w_px", "h_px"))
-                    data = raster.read_window(x, y, w, h, w, h)
                     filename = row["block_id"] + ".png"
-                    # Let Pillow infer L or I;16: forcing L reinterprets uint16 bytes.
-                    Image.fromarray(data).save(crops_dir / filename)
-                    # Reopen the encoded file before publishing: this checks
-                    # decoding, shape, bit depth, and every source pixel.
-                    with Image.open(crops_dir / filename) as saved:
-                        decoded = np.array(saved)
-                    if decoded.dtype != data.dtype or not np.array_equal(decoded, data):
-                        raise ValueError(f"Crop failed source-pixel verification: {filename}")
+                    if reuse is not None and _copy_verified_crop(reuse, row, crops_dir / filename):
+                        reused += 1
+                    else:
+                        data = raster.read_window(x, y, w, h, w, h)
+                        # Let Pillow infer L or I;16: preserve native source pixels.
+                        Image.fromarray(data).save(crops_dir / filename)
+                        with Image.open(crops_dir / filename) as saved:
+                            decoded = np.array(saved)
+                        if decoded.dtype != data.dtype or not np.array_equal(decoded, data):
+                            raise ValueError(f"Crop failed source-pixel verification: {filename}")
+                        created += 1
                     writer.writerow({"block_id": row["block_id"], "obs_id": row["obs_id"], "x_px": x, "y_px": y,
                                      "w_px": w, "h_px": h, "class_id": row["class_id"],
                                      "class_name": classes_scheme.get_name(row["class_id"]),
@@ -159,9 +279,6 @@ def export_probe_set(
                     if progress_cb:
                         progress_cb(count, len(labeled))
             (staged / "classes.json").write_text(json.dumps({"classes": classes}, indent=2))
-            block_size = metadata.get("block_size") or max(
-                max(r["w_px"], r["h_px"]) for r in labeled
-            )
             dataset_metadata = {
                 "format": "mars-block-crops", "version": 1,
                 "target_kind": "whole_block_majority_class", "label_origin": label_origin,
@@ -188,8 +305,16 @@ def export_probe_set(
             # Validate the portable format against the archived label snapshot.
             BlockCropDataset(staged).validate(should_cancel=should_cancel)
             check_cancelled()
+            checksums = read_integrity(staged)
+            checksums["integrity.json"] = file_sha256(staged / "integrity.json")
             staged.replace(output_dir)
-    return len(labeled)
+    folder = output_dir.resolve()
+    cache = ExportCache(
+        folder, signature, source_key, tuple(bounds) if bounds is not None else None,
+        {r["block_id"]: tuple(r[k] for k in ("x_px", "y_px", "w_px", "h_px")) for r in labeled},
+        checksums,
+    )
+    return ExportResult(folder, len(labeled), created, reused, False, cache)
 
 
 
@@ -203,8 +328,11 @@ Abstain, nodata, and unlabeled blocks have no crop. Edge crops keep their true
 width/height. Source coordinates, observation ID, dtype, and edit count travel
 with each pair. `labels.parquet` archives the complete label snapshot.
 
-`integrity.json` records SHA-256 checksums. Every crop was reopened and compared
-pixel-for-pixel with the source before this folder was published. To recheck
+`integrity.json` records SHA-256 checksums. Newly generated crops are reopened
+and compared pixel-for-pixel with the source. Reused crops must match the trusted
+checksums from a previous source-verified export in the same session; they are
+independent copies, so older exports can be moved or deleted. The complete folder
+is verified before publishing. To recheck
 the folder after copying it, without requiring PyTorch:
 
 ```bash

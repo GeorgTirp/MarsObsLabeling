@@ -13,7 +13,13 @@ resizable block inspector with view and analysis controls on the right. It runs
 locally in PySide6 with the existing Python raster, labeling, and inference core.
 Open JP2 or GeoTIFF imagery from **Open observation** (or Ctrl/Cmd+O). The toolbar
 exposes zoom, **Fit panel**, and keyboard help; all labeling shortcuts remain
-available. The inspector shows native image crops scaled to its available width.
+available. The labeler opens maximized with a large **Block preview** visible on
+the right: this full native crop is the detail view used to decide the class.
+Drag its divider to adjust the size. **Focus block** (F11) enlarges that preview,
+keeping the class legend and labeling keys available; press it again to restore
+the map and panels. Crops fit the available width and height without clipping or
+changing their aspect ratio. Export, panel controls, and observation-wide progress
+remain visible in both views.
 
 **Spatial hierarchy:**
 - **Panel**: a large square region (default 4096×4096 px) shown one at a time
@@ -234,9 +240,25 @@ Press the **hotkey** for the majority terrain class in the current block:
 - **s** = Dust/mantled
 - **d** = Crater interior
 - **f** = Slope/scarp
-- **Space** = Abstain (uncertain/mixed) → auto-advance
+- **Space** = Abstain/Skip (no label assigned) → auto-advance
 
 Blocks auto-advance to the next unlabeled block in reading order.
+Entering a panel from the panel list, overview or Page Up/Down selects its first
+unlabeled, usable block. Completed panels remain available for review. Clicking
+a particular block still selects that exact block.
+
+The progress bar shows labeled blocks against all blocks inside the HiRISE image,
+including partial edge blocks. Hover for skipped, no-data and remaining counts.
+Skipped and no-data blocks do not count as labels; empty padding outside the image
+is excluded from the total.
+
+Choose **Edit → Customize class keys…** (also available in **Shortcuts**) to
+change terrain and skip keys. Each key must be unique; reserved navigation/zoom
+keys cannot be assigned. Use a single character, `space`, or leave a field blank
+to label that class via the legend. Preferences persist across restarts and
+observations in `app.shortcuts.json` beside the app config, which Git ignores.
+They do not alter class IDs, labels, or the shared class definitions. **Restore
+defaults**, then **Save**, returns to the keys in the class scheme.
 
 ### Navigate without labeling
 - **← / →** = Move left / right
@@ -259,9 +281,13 @@ Blocks auto-advance to the next unlabeled block in reading order.
 
 ### Clear a block
 - **Backspace / Delete** = Clear current block back to unlabeled
+- Turn on **Erase**, then drag with the left mouse button to clear multiple blocks.
+  Turn it off or press a class key to return to labeling. Each stroke is one undo step.
+- **Shift + drag**, then **Backspace / Delete** = Erase a rectangular selection
+- Hold a class key and select blocks with the left mouse button to paint a region.
 
 ### Help
-- **?** = Show keybinding cheat-sheet (future implementation)
+- **?** = Show keybinding cheat-sheet
 
 ## Persistence & Resume
 
@@ -307,7 +333,7 @@ geometry and observation metadata.
 ### Export crops and labels from the GUI
 
 Click **Export Labels** to save the current labels, including edits that have not
-been autosaved yet, as a new folder:
+been autosaved yet, as a complete dataset folder:
 
 ```text
 exports/<observation>/dataset-<timestamp>/
@@ -326,12 +352,29 @@ blocks are excluded. PNGs preserve native **uint8 or uint16** pixels exactly,
 including partial edge crops. Each label describes the whole block's majority
 terrain. The original observation is not needed to read the exported folder.
 
-Export runs with progress and cancellation. Every PNG is reopened and compared
-pixel-for-pixel with its source window, and the crop/label manifest is checked
-against the archived label snapshot before publishing. A failed or cancelled
-export leaves no partial dataset. Re-exporting makes a new timestamped folder;
-previous exports are preserved, and cleared labels cannot leave stale crops in
-the new dataset. The completion dialog shows the folder location.
+Export runs with progress and cancellation. Newly generated PNGs are reopened
+and compared pixel-for-pixel with their source windows. Every complete new
+dataset is checked against its archived labels before publishing; failures and
+cancellation leave no partial dataset.
+
+Repeated exports of the same open observation reuse the last successful export:
+
+- **Nothing changed:** the existing folder is verified against checksums retained
+  in memory. The dialog reports **Already up to date**; no new folder or crops are
+  created. Moving the cursor or saving the session does not count as a label edit.
+- **Labels changed:** a complete new timestamped folder is created. Valid existing
+  crops are copied without decoding the source window or encoding another PNG.
+  Relabeling updates the label mapping; newly labeled blocks get new crops, and
+  cleared/abstained/nodata blocks are excluded. The dialog reports reused and
+  newly generated crop counts.
+- **Old files are missing or damaged:** affected crops are regenerated from the
+  original observation. Checksums come from the successful export held in memory,
+  so rewriting an old folder's integrity manifest cannot hide swapped crops.
+
+Previous exports remain untouched. Copied crops are independent files, so deleting
+or editing an older export cannot damage a newer dataset. Reuse is scoped to the
+current open observation in the current app session; restarting/reopening begins
+with a fresh export. The original observation is still checked for changes.
 
 ### Load the folder for block classification
 
@@ -584,7 +627,7 @@ classes:
 
 abstain:
   id: -1
-  name: "Abstain"
+  name: "Abstain/Skip (no label assigned)"
   color: "#000000"
   hotkey: "space"
 

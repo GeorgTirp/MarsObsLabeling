@@ -70,9 +70,11 @@ class KeyboardController:
 
         # Class hotkeys
         else:
+            if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+                return False
             # The spacebar produces a " " character, but the config stores the
             # abstain hotkey as the readable token "space" — normalize so both match.
-            lookup_key = text
+            lookup_key = text.lower()
             if key == Qt.Key.Key_Space or text == " ":
                 lookup_key = "space"
 
@@ -119,7 +121,7 @@ class KeyboardController:
     def _handle_abstain(self) -> bool:
         """Abstain on current block and auto-advance."""
         panel_before = self.session.current_block().panel_idx
-        self.session.abstain_current_block()
+        self.session.abstain_current_block(self.classes_scheme.abstain.name)
         self.last_action_type = "abstain"
 
         if self.on_label_changed:

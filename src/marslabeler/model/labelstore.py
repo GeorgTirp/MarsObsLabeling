@@ -258,19 +258,31 @@ class LabelStore:
         record.edit_count += 1
         self.redo_stack.clear()
 
-    def clear(self, block_id: str) -> None:
+    def clear(self, block_id: str, *, snapshot: bool = True) -> None:
         """Clear a block back to unlabeled."""
         if block_id not in self.records:
             raise ValueError(f"Unknown block: {block_id}")
 
-        self._save_undo_state()
+        if snapshot:
+            self._save_undo_state()
         record = self.records[block_id]
         record.class_id = -3
         record.class_name = "unlabeled"
         record.status = "unlabeled"
         record.updated_utc = int(time.time() * 1000)
         record.edit_count += 1
-        self.redo_stack.clear()
+        if snapshot:
+            self.redo_stack.clear()
+
+    def bulk_clear(self, block_ids: list[str]) -> int:
+        """Erase assigned/skipped blocks with one undo step; preserve nodata."""
+        targets = list(dict.fromkeys(
+            bid for bid in block_ids
+            if bid in self.records and self.records[bid].status in ("labeled", "abstain")
+        ))
+        for i, bid in enumerate(targets):
+            self.clear(bid, snapshot=i == 0)
+        return len(targets)
 
     def undo(self) -> None:
         """Undo the last label action."""

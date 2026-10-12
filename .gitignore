@@ -21,6 +21,8 @@ configs/predictions/
 exports/
 *.parquet
 *.session.json
+# Personal key bindings, kept separate from shared class definitions
+*.shortcuts.json
 
 # ---- Model checkpoints (mars-inference input, not version-controlled) ----
 *.pt

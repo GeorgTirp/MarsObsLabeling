@@ -1,5 +1,6 @@
 """Terrain class scheme: load, validate, and manage class definitions."""
 
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,7 +9,21 @@ import yaml
 # Reserved class IDs that must not be used by user-assignable classes
 RESERVED_IDS = {-1, -2}
 # Navigation keys that must not collide with class hotkeys (not including space, which is abstain)
-RESERVED_HOTKEYS = {"?"}  # Help overlay
+RESERVED_HOTKEYS = {"?", "o", "+", "=", "-", "_"}  # Help, overview, zoom
+ABSTAIN_DISPLAY_NAME = "Abstain/Skip (no label assigned)"
+
+
+def normalize_hotkey(value: str | None) -> str | None:
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError("A class key must be a character or 'space'.")
+    key = "space" if value == " " else value.strip().lower()
+    if not key:
+        return None
+    if key != "space" and (len(key) != 1 or not key.isprintable()):
+        raise ValueError(f"Invalid key '{value}': use one character, 'space', or leave blank.")
+    return key
 
 
 @dataclass
@@ -58,7 +73,8 @@ class ClassScheme:
 
         # Check hotkey uniqueness
         hotkeys_used = {}
-        for cls in self.classes.values():
+        for cls in [*self.classes.values(), self.abstain]:
+            cls.hotkey = normalize_hotkey(cls.hotkey)
             if cls.hotkey and cls.hotkey in hotkeys_used:
                 raise ValueError(
                     f'Hotkey "{cls.hotkey}" used by both "{cls.name}" and '
@@ -83,6 +99,9 @@ class ClassScheme:
             cls.validate_color()
         self.abstain.validate_color()
         self.nodata.validate_color()
+        self.hotkey_to_id = {
+            c.hotkey: c.id for c in [*self.classes.values(), self.abstain] if c.hotkey
+        }
 
     def get_name(self, class_id: int) -> str:
         """Get class name by ID."""
@@ -93,6 +112,15 @@ class ClassScheme:
         if class_id == self.nodata.id:
             return self.nodata.name
         raise ValueError(f"Unknown class ID: {class_id}")
+
+    def with_hotkeys(self, overrides: dict[int, str | None]) -> "ClassScheme":
+        """Return a validated copy; preferences never change class IDs or labels."""
+        scheme = deepcopy(self)
+        for cls in [*scheme.classes.values(), scheme.abstain]:
+            if cls.id in overrides:
+                cls.hotkey = normalize_hotkey(overrides[cls.id])
+        scheme.validate()
+        return scheme
 
     def get_color(self, class_id: int) -> str:
         """Get class color by ID."""
@@ -150,7 +178,7 @@ def load_classes(yaml_path: str | Path) -> ClassScheme:
     abstain_data = data.get("abstain", {})
     abstain = TerrainClass(
         id=abstain_data.get("id", -1),
-        name=abstain_data.get("name", "Abstain"),
+        name=abstain_data.get("name", ABSTAIN_DISPLAY_NAME),
         color=abstain_data.get("color", "#000000"),
         hotkey=abstain_data.get("hotkey", "space"),
     )

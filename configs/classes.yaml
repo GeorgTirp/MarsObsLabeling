@@ -65,7 +65,7 @@ classes:
 # Reserved, not user-assignable via class hotkeys:
 abstain:
   id: -1
-  name: "Abstain"
+  name: "Abstain/Skip (no label assigned)"
   color: "#808080"
   hotkey: "space"
 

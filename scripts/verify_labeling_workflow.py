@@ -27,7 +27,9 @@ from torch.utils.data import DataLoader
 import yaml
 
 from marslabeler.ui.mainwindow import MainWindow
+from marslabeler.io.raster import RasterSource
 from marslabeler.model.cropdataset import BlockCropDataset
+from marslabeler.model.dataset_integrity import file_sha256
 
 
 def run(source, output):
@@ -188,6 +190,59 @@ def run(source, output):
         draw.text((px, py + 303), f"QA class {row['class_id']} | ({row['x_px']}, {row['y_px']})", fill='black')
         draw.text((px, py + 318), row['class_name'], fill='black')
     sheet.save(output / 'verified_crops.png')
+
+    # Re-export in this same GUI session: verify the no-op, then add one block
+    # and relabel another. The original dataset must remain byte-for-byte intact.
+    previous_files = {p.relative_to(gui_export): file_sha256(p)
+                      for p in gui_export.rglob('*') if p.is_file()}
+    reads, encoded = [], []
+    read_window, image_save = RasterSource.read_window, Image.Image.save
+
+    def track_read(reader, *args, **kwargs):
+        reads.append(args)
+        return read_window(reader, *args, **kwargs)
+
+    def track_save(image, filename, *args, **kwargs):
+        encoded.append(Path(filename).name)
+        return image_save(image, filename, *args, **kwargs)
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(output)
+        with patch.object(RasterSource, 'read_window', track_read), \
+             patch.object(Image.Image, 'save', track_save), \
+             patch.object(QMessageBox, 'information', lambda *args: None), \
+             patch.object(QMessageBox, 'warning', lambda *args: errors.append(args[2])):
+            QTest.mouseClick(resumed.export_button, Qt.MouseButton.LeftButton)
+            assert not errors, errors
+            assert resumed.last_export_path == gui_export
+            assert reads == encoded == []
+            extra = next(b for b in candidates if b.block_id not in expected)
+            resumed.session.labels.assign(extra.block_id, 6, resumed.classes_scheme.get_name(6))
+            resumed.session.labels.assign(targets[0].block_id, 17, resumed.classes_scheme.get_name(17))
+            QTest.mouseClick(resumed.export_button, Qt.MouseButton.LeftButton)
+            assert not errors, errors
+            updated_export = resumed.last_export_path
+            assert updated_export != gui_export
+            assert len(reads) == 1 and encoded == [extra.block_id + '.png']
+    finally:
+        os.chdir(previous_cwd)
+    updated = BlockCropDataset(updated_export)
+    assert updated.validate()['count'] == 7
+    updated_expected = {**expected, extra.block_id: 6, targets[0].block_id: 17}
+    assert {r['block_id']: int(r['class_id']) for r in updated.records} == updated_expected
+    with rasterio.open(source) as original:
+        for row in updated.records:
+            x, y, w, h = (int(row[k]) for k in ('x_px', 'y_px', 'w_px', 'h_px'))
+            native = original.read(1, window=rasterio.windows.Window(x, y, w, h))
+            with Image.open(updated_export / 'crops' / row['crop_filename']) as crop:
+                decoded = np.array(crop)
+            assert decoded.dtype == native.dtype
+            np.testing.assert_array_equal(decoded, native)
+    assert previous_files == {p.relative_to(gui_export): file_sha256(p)
+                              for p in gui_export.rglob('*') if p.is_file()}
+    print('Repeated export: unchanged folder reused; then 6 crops reused and 1 generated. '
+          'All 7 current pairs verified; original files unchanged.', flush=True)
     report = {'source': str(source), 'source_fingerprint': resumed.session.raster.fingerprint(),
               'note': 'Mechanical QA labels only, not scientific terrain annotations.',
               'labels_verified': 6, 'workflow': ['GUI click', 'class hotkey', 'count autosave',
@@ -196,6 +251,11 @@ def run(source, output):
               'shuffled PyTorch batch', 'backward and optimizer step'],
               'gui_export': str(gui_export), 'integrity': integrity_result, 'crop_checks': checks, 'training_batch_shape': list(images.shape),
               'training_labels': labels.tolist(), 'training_loss': float(loss.detach()),
+              'repeated_export': {'unchanged_reused_existing_folder': True,
+                                  'updated_folder': str(updated_export),
+                                  'total_pairs': 7, 'reused_crops': 6, 'new_crops': 1,
+                                  'source_crop_reads': len(reads), 'png_encodes': len(encoded),
+                                  'original_dataset_unchanged': True},
               'elapsed_seconds': time.monotonic() - started}
     (output / 'verification.json').write_text(json.dumps(report, indent=2))
     assert resumed.close()

@@ -52,10 +52,16 @@ class Session:
         self.current_block_idx = block_idx
 
     def move_to_panel(self, panel_idx: int) -> None:
-        """Jump to first block of a panel."""
+        """Start at the first available unlabeled block; completed panels stay reviewable."""
         if panel_idx < 0 or panel_idx >= self.grid.num_panels:
             return
         self.current_block_idx = panel_idx * self.grid.blocks_per_panel
+        for block in self.grid.get_panel_blocks(panel_idx):
+            if (block.w_px > 0 and block.h_px > 0
+                    and self.labels.get_record(block.block_id).status == "unlabeled"
+                    and not self._should_skip_block(block)):
+                self.current_block_idx = self.grid.block_index_at_pixel(block.x_px, block.y_px)
+                return
 
     def label_current_block(self, class_id: int, class_name: str) -> None:
         """Label the current block and auto-advance."""
@@ -70,9 +76,9 @@ class Session:
         if not was_labeled or self.config.get("navigation", {}).get("advance_on_edit", False):
             self._auto_advance()
 
-    def abstain_current_block(self) -> None:
+    def abstain_current_block(self, class_name: str = "Abstain/Skip (no label assigned)") -> None:
         """Mark current block as abstain and auto-advance."""
-        self.label_current_block(-1, "Abstain")
+        self.label_current_block(-1, class_name)
 
     def clear_current_block(self) -> None:
         """Clear current block back to unlabeled."""
@@ -128,11 +134,11 @@ class Session:
         # 3) Current panel fully done → next incomplete panel (then wrap around)
         for panel_idx in range(current_panel + 1, self.grid.num_panels):
             if not self._is_panel_complete(panel_idx):
-                self.current_block_idx = panel_idx * self.grid.blocks_per_panel
+                self.move_to_panel(panel_idx)
                 return
         for panel_idx in range(self.grid.num_panels):
             if not self._is_panel_complete(panel_idx):
-                self.current_block_idx = panel_idx * self.grid.blocks_per_panel
+                self.move_to_panel(panel_idx)
                 return
 
     def _advance_to_next_sequential(self) -> None:
@@ -148,6 +154,8 @@ class Session:
         while hunting for the next unlabeled block, so decoding a window per block
         here makes navigation stutter on a large observation.
         """
+        if block.w_px <= 0 or block.h_px <= 0:
+            return True
         skip_config = self.config.get("skip", {})
         nodata_threshold = skip_config.get("nodata_skip_threshold", 0.5)
         variance_threshold = skip_config.get("variance_skip_threshold", 0.0)

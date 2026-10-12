@@ -4,14 +4,14 @@ import traceback
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QProgressBar, QVBoxLayout
 
-from marslabeler.model.cropexport import ExportCancelled, export_probe_set
+from marslabeler.model.cropexport import ExportCancelled, export_crop_dataset
 from marslabeler.model.export import export_coarse_geotiff
 
 
 class ExportWorker(QThread):
     progress = Signal(int, int)
 
-    def __init__(self, source, snapshot, classes_path, output, grid, predictions_mode):
+    def __init__(self, source, snapshot, classes_path, output, grid, predictions_mode, reuse=None):
         super().__init__()
         self.source = source
         self.snapshot = snapshot
@@ -19,6 +19,8 @@ class ExportWorker(QThread):
         self.output = output
         self.grid = grid
         self.predictions_mode = predictions_mode
+        self.reuse = reuse
+        self.export_result = None
         self.count = 0
         self.error = None
         self.cancelled = False
@@ -33,13 +35,15 @@ class ExportWorker(QThread):
                 labels = LabelStore.load_parquet(self.snapshot, self.grid, strict=True)
                 export_coarse_geotiff(labels, self.grid, folder / "labels_coarse.tif")
 
-            self.count = export_probe_set(
+            self.export_result = export_crop_dataset(
                 self.source, self.snapshot, self.classes_path, self.output,
                 progress_cb=self.progress.emit,
                 should_cancel=self.isInterruptionRequested,
                 prepare_archives=archives,
                 label_origin="prediction_review" if self.predictions_mode else "labeling_session",
+                reuse=self.reuse,
             )
+            self.count = self.export_result.count
         except ExportCancelled:
             self.cancelled = True
         except Exception as exc:
@@ -48,13 +52,13 @@ class ExportWorker(QThread):
 
 
 class ExportDialog(QDialog):
-    def __init__(self, source, snapshot, classes_path, output, grid, predictions_mode, parent=None):
+    def __init__(self, source, snapshot, classes_path, output, grid, predictions_mode, parent=None, *, reuse=None):
         super().__init__(parent)
         self.setWindowTitle("Export crops and labels")
         self.setMinimumWidth(420)
         self.setModal(True)
         layout = QVBoxLayout(self)
-        self.status = QLabel("Checking labels and preparing image crops…")
+        self.status = QLabel("Checking labels and previously exported crops…")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.progress = QProgressBar()
@@ -63,7 +67,7 @@ class ExportDialog(QDialog):
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
-        self.worker = ExportWorker(source, snapshot, classes_path, output, grid, predictions_mode)
+        self.worker = ExportWorker(source, snapshot, classes_path, output, grid, predictions_mode, reuse)
         self.worker.progress.connect(self._progress)
         self.worker.finished.connect(self._finished)
 
@@ -73,7 +77,7 @@ class ExportDialog(QDialog):
         if not self.worker.isInterruptionRequested():
             self.status.setText(
                 "Verifying dataset files and label mappings…" if done == total
-                else f"Exporting crop {done:,} of {total:,}"
+                else f"Checking and preparing crop {done:,} of {total:,}"
             )
 
     def _finished(self):

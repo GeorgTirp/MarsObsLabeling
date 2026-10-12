@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QSizePolicy,
     QScrollArea,
+    QProgressBar,
 )
 from PySide6.QtGui import QAction, QKeyEvent, QKeySequence
 
@@ -68,6 +69,7 @@ class MainWindow(QMainWindow):
         if config_path is None:
             config_path = Path("configs/app.yaml")
         self.config = load_config(config_path)
+        self.shortcuts_path = Path(config_path).with_suffix(".shortcuts.json")
 
         # Predictions mode (mars-inference): labels_dir points at a per-model predictions
         # cache instead of the configured labels folder, and a Save Predictions button
@@ -81,6 +83,7 @@ class MainWindow(QMainWindow):
         # open and visible alongside it.
         self._summary_dialog = None
         self._save_failure_notified = False
+        self._crop_export_cache = None
 
         # Analysis layers (mars-inference): which overlay the canvas is showing, and
         # the per-block data behind it. All empty/None until inference actually runs
@@ -141,6 +144,9 @@ class MainWindow(QMainWindow):
         # Region labeling: held class key (drag-paint brush) + last used class
         self.held_class_id: Optional[int] = None
         self.last_class_id: Optional[int] = None
+        self._erase_key_held = False
+        self._stroke_changed = False
+        self._focus_sizes = None
         # Active marquee selection (r0, c0, r1, c1) awaiting a class key to fill
         self.selection_rect: Optional[tuple[int, int, int, int]] = None
         # View mode: "panel" (single, labelable) | "multi" (NxN panels) | "overview" (whole image)
@@ -202,13 +208,13 @@ class MainWindow(QMainWindow):
 
         # Right: Preview (top) + action buttons
         right_layout = QVBoxLayout()
-        right_layout.setContentsMargins(14, 16, 14, 14)
+        right_layout.setContentsMargins(8, 8, 8, 8)
         right_layout.setSpacing(8)
         self.right_layout = right_layout
 
         # Side preview (top)
         self.preview = SidePreview()
-        right_layout.addWidget(self.preview)
+        right_layout.addWidget(self.preview, 1)
 
         right_layout.addWidget(self._section_label("VIEW & ANALYSIS"))
 
@@ -251,21 +257,14 @@ class MainWindow(QMainWindow):
         self.render_mode_button.clicked.connect(self._toggle_render_mode)
         right_layout.addWidget(self.render_mode_button)
 
-        right_layout.addStretch(1)
-        right_layout.addWidget(self._section_label("SESSION"))
         self.next_panel_button = QPushButton("Complete && next panel")
         self.next_panel_button.setToolTip("Fill remaining unlabeled blocks as NA, save, and advance to the next panel.")
         self.next_panel_button.setEnabled(False)
         self.next_panel_button.clicked.connect(self._go_to_next_panel)
-        right_layout.addWidget(self.next_panel_button)
-        next_hint = QLabel("Remaining blocks are filled as NA.")
-        next_hint.setProperty("role", "muted")
-        right_layout.addWidget(next_hint)
 
         self.export_button = QPushButton("Export Labels")
         self.export_button.setEnabled(False)
         self.export_button.clicked.connect(self._export)
-        right_layout.addWidget(self.export_button)
 
         # Only shown in predictions mode (mars-inference)
         self.save_predictions_button = QPushButton("Save predictions")
@@ -285,13 +284,14 @@ class MainWindow(QMainWindow):
         inspector_scroll.setMinimumWidth(280)
         inspector_scroll.setWidget(right_widget)
         main_layout.addWidget(inspector_scroll)
+        self.inspector_scroll = inspector_scroll
         for button in right_widget.findChildren(QPushButton):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        # Canvas gets the extra space when the window resizes; history/legend/
-        # right columns stay put unless the user drags a handle themselves.
+        # Give the native block crop enough width to make classification
+        # decisions. The map receives extra space; all dividers remain movable.
         main_layout.setStretchFactor(main_layout.indexOf(self.canvas), 1)
-        main_layout.setSizes([156, 742, 250, 280])
+        main_layout.setSizes([144, 477, 250, 560])
         # setChildrenCollapsible(False) alone leaves isCollapsible() reporting
         # True per pane in this Qt build (childrenCollapsible is the runtime
         # default; isCollapsible() reflects each pane's own override, which
@@ -299,6 +299,24 @@ class MainWindow(QMainWindow):
         # too so a stray drag can't hide the canvas or legend entirely.
         for i in range(main_layout.count()):
             main_layout.setCollapsible(i, False)
+
+        session_bar = QFrame()
+        session_bar.setObjectName("viewToolbar")
+        session_tools = QHBoxLayout(session_bar)
+        session_tools.setContentsMargins(16, 6, 16, 6)
+        session_tools.addWidget(QLabel("OBSERVATION PROGRESS"))
+        self.label_progress = QProgressBar()
+        self.label_progress.setRange(0, 1)
+        self.label_progress.setValue(0)
+        self.label_progress.setFormat("Open an observation")
+        self.label_progress.setMinimumHeight(24)
+        self.label_progress.setMinimumWidth(220)
+        session_tools.addWidget(self.label_progress, 1)
+        session_tools.addWidget(self.next_panel_button)
+        session_tools.addWidget(self.export_button)
+        for button in (self.next_panel_button, self.export_button):
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        shell.addWidget(session_bar)
 
         # Status bar
         self.statusBar = QStatusBar()
@@ -339,6 +357,7 @@ class MainWindow(QMainWindow):
 
     def _setup_workspace_header(self, shell):
         header = QFrame()
+        self.workspace_header = header
         header.setObjectName("workspaceHeader")
         row = QHBoxLayout(header)
         row.setContentsMargins(20, 12, 20, 12)
@@ -381,12 +400,22 @@ class MainWindow(QMainWindow):
         tools.setSpacing(6)
         self.view_label = QLabel("IMAGE VIEWER")
         self.view_label.setProperty("role", "section")
-        tools.addWidget(self.view_label)
-        tools.addStretch()
-        hint = QLabel("Class key to label  ·  Shift + drag to select")
-        hint.setProperty("role", "muted")
-        tools.addWidget(hint)
-        tools.addSpacing(16)
+        self.view_label.setMinimumWidth(0)
+        self.view_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        tools.addWidget(self.view_label, 1)
+        self.erase_button = self._workspace_button("Erase", self._toggle_erase)
+        self.erase_button.setCheckable(True)
+        self.erase_button.setEnabled(False)
+        self.erase_button.setToolTip("Turn on, then drag across blocks to erase. One stroke is one undo step.")
+        self.details_button = self._workspace_button("Block preview", self._toggle_details)
+        self.details_button.setCheckable(True)
+        self.details_button.setChecked(True)
+        self.details_button.setToolTip("Show the block preview and analysis sidebar")
+        self.focus_button = self._workspace_button("Focus block", self._toggle_focus_view)
+        self.focus_button.setCheckable(True)
+        self.focus_button.setToolTip("Enlarge the current block preview, keeping the class legend and labeling keys (F11)")
+        for button in (self.erase_button, self.details_button, self.focus_button):
+            tools.addWidget(button)
         self.zoom_out_button = self._workspace_button("−", lambda: self._workspace_zoom(False))
         self.zoom_out_button.setToolTip("Zoom out (−)")
         self.zoom_in_button = self._workspace_button("+", lambda: self._workspace_zoom(True))
@@ -397,6 +426,38 @@ class MainWindow(QMainWindow):
             button.setEnabled(False)
             tools.addWidget(button)
         shell.addWidget(toolbar)
+
+    def _toggle_details(self, checked):
+        self.inspector_scroll.setVisible(checked and not self.focus_button.isChecked())
+
+    def _toggle_focus_view(self, checked):
+        if checked:
+            if self._showing_summary:
+                self._close_class_summary()
+            if self.session and self.view_mode != "panel":
+                self._set_view("panel")
+            self._focus_sizes = self.main_layout.sizes()
+        self.workspace_header.setVisible(not checked)
+        self.history_panel.setVisible(not checked)
+        self.main_layout.widget(1).setVisible(not checked)
+        self.legend_panel.setVisible(True)
+        self.inspector_scroll.setVisible(checked or self.details_button.isChecked())
+        self.details_button.setEnabled(not checked)
+        if checked:
+            legend_width = self._focus_sizes[2]
+            self.main_layout.setSizes([0, 0, legend_width, sum(self._focus_sizes) - legend_width])
+        elif self._focus_sizes is not None:
+            self.main_layout.setSizes(self._focus_sizes)
+        self.focus_button.setText("Exit focus" if checked else "Focus block")
+        self.setFocus()
+
+    def _toggle_erase(self, checked):
+        self._on_block_paint_end()
+        self.held_class_id = None
+        if checked:
+            self._clear_selection()
+        self.canvas.viewport().setCursor(Qt.CursorShape.CrossCursor if checked else Qt.CursorShape.ArrowCursor)
+        self.status_label.setText("Erase: drag over blocks. Ctrl+Z undoes a stroke." if checked else "Labeling mode")
 
     def _setup_empty_workspace(self):
         self.empty_workspace = QWidget(self.canvas.viewport())
@@ -445,12 +506,15 @@ class MainWindow(QMainWindow):
 
     def _sync_workspace(self):
         """Keep shell metadata in sync without scanning labels or reading imagery."""
+        self.canvas.paint_enabled = self.view_mode == "panel" and not self._showing_summary
         self._sync_legend_selection()
         loaded = self.session is not None
         self.empty_workspace.setVisible(not loaded)
-        for button in (self.workspace_save_button, self.zoom_out_button, self.zoom_in_button, self.fit_button):
+        for button in (self.workspace_save_button, self.zoom_out_button, self.zoom_in_button, self.fit_button, self.erase_button):
             button.setEnabled(loaded)
         self.help_button.setEnabled(self.classes_scheme is not None)
+        if hasattr(self, "shortcuts_action"):
+            self.shortcuts_action.setEnabled(self.classes_scheme is not None)
         if not loaded:
             self.observation_label.setText("No observation open")
             self.observation_label.setToolTip("")
@@ -505,6 +569,41 @@ class MainWindow(QMainWindow):
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+        edit_menu = menubar.addMenu("Edit")
+        self.shortcuts_action = QAction("Customize class keys...", self)
+        self.shortcuts_action.setEnabled(False)
+        self.shortcuts_action.triggered.connect(self._customize_shortcuts)
+        edit_menu.addAction(self.shortcuts_action)
+        view_menu = menubar.addMenu("View")
+        focus_action = QAction("Toggle block focus", self)
+        focus_action.setShortcut("F11")
+        focus_action.triggered.connect(self.focus_button.click)
+        view_menu.addAction(focus_action)
+
+    def _customize_shortcuts(self):
+        if self.classes_scheme is None:
+            return
+        from marslabeler.shortcuts import save_shortcuts
+        from marslabeler.ui.shortcutdialog import ShortcutDialog
+
+        self._on_block_paint_end()
+        self.held_class_id = None
+        self._erase_key_held = False
+        try:
+            defaults = load_classes(self.config.paths.classes_file)
+            dialog = ShortcutDialog(self.classes_scheme, defaults, self)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            save_shortcuts(self.shortcuts_path, dialog.selected_scheme)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "Could not save class keys", str(error))
+            return
+        self.classes_scheme = dialog.selected_scheme
+        if self.controller:
+            self.controller.classes_scheme = self.classes_scheme
+        self._update_legend_panel()
+        self.status_label.setText("Class keys saved · applies to all observations on this installation")
 
     def _on_open_file(self):
         """File→Open JP2 dialog."""
@@ -723,6 +822,14 @@ class MainWindow(QMainWindow):
 
             # Load classes
             classes_scheme = load_classes(self.config.paths.classes_file)
+            from marslabeler.shortcuts import load_shortcuts
+            try:
+                classes_scheme = load_shortcuts(self.shortcuts_path, classes_scheme)
+            except (OSError, ValueError) as error:
+                QMessageBox.warning(
+                    self, "Could not load custom keys",
+                    f"Using the default keys. Labels are unaffected.\n\n{error}",
+                )
 
             # Create or load session
             try:
@@ -753,7 +860,13 @@ class MainWindow(QMainWindow):
 
             recovered = labels_dir != self.labels_dir
             self.session = new_session
+            self._stroke_changed = False
+            self.held_class_id = None
+            self._erase_key_held = False
+            self.erase_button.setChecked(False)
+            self.canvas.viewport().unsetCursor()
             self.labels_dir = labels_dir
+            self._crop_export_cache = None
             self._save_failure_notified = False
             self.workspace_save_button.setText("Save predictions" if self.predictions_mode else "Save labels")
             self.workspace_save_button.setToolTip(str(self.labels_dir.resolve()))
@@ -1251,6 +1364,9 @@ class MainWindow(QMainWindow):
         if self._showing_summary:
             return
 
+        if self.erase_button.isChecked():
+            self.erase_button.click()
+
         # A marquee selection is an explicit "label THESE blocks" gesture, so a
         # class click fills it rather than labelling only the cursor's block.
         if self.selection_rect is not None:
@@ -1269,6 +1385,8 @@ class MainWindow(QMainWindow):
         opens on another Space, so the old dialog reported itself open while
         nothing became visible. Clicking Summary again returns to the map.
         """
+        if self.focus_button.isChecked():
+            self.focus_button.click()
         if self._showing_summary:
             self._close_class_summary()
             return
@@ -1457,10 +1575,14 @@ class MainWindow(QMainWindow):
         # synchronously so the splitter never briefly shows both.
         old_widget = self.history_panel
         old_index = self.main_layout.indexOf(old_widget)
+        sizes = self.main_layout.sizes()
         self.main_layout.insertWidget(old_index, history)
         old_widget.setParent(None)
         old_widget.deleteLater()
         self.history_panel = history
+        history.setVisible(not self.focus_button.isChecked())
+        self.main_layout.setSizes(sizes)
+        self._update_label_progress()
 
     def _update_legend_panel(self):
         """Swap the legend placeholder for the real legend (by reference)."""
@@ -1479,6 +1601,7 @@ class MainWindow(QMainWindow):
         old_widget.deleteLater()
         self.main_layout.setSizes(sizes)
         self.legend_panel = legend
+        legend.setVisible(True)
         self._sync_legend_selection()
 
     def _sync_legend_selection(self) -> None:
@@ -1690,7 +1813,9 @@ class MainWindow(QMainWindow):
         """Resolve a key event to any class id (user classes or abstain), or None."""
         if not self.classes_scheme:
             return None
-        text = event.text()
+        if event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
+            return None
+        text = event.text().lower()
         if event.key() == Qt.Key.Key_Space or text == " ":
             text = "space"
         return self.classes_scheme.hotkey_to_id.get(text)
@@ -1701,26 +1826,40 @@ class MainWindow(QMainWindow):
         return cid if (cid is not None and cid >= 0) else None
 
     def _on_block_paint(self, block_row: int, block_col: int, is_start: bool) -> None:
-        """Drag-paint: label the block under the cursor with the held class brush."""
-        if self.held_class_id is None or not self.session or self.view_mode != "panel":
+        """Paint or erase, grouping all changed blocks in a stroke for undo."""
+        if is_start:
+            self._on_block_paint_end()
+        erase = self.erase_button.isChecked() or self._erase_key_held
+        if (self.held_class_id is None and not erase) or not self.session or self.view_mode != "panel":
             return
         block = self._panel_block_map().get((block_row, block_col))
         if block is None or block.w_px <= 0 or block.h_px <= 0:
             return
-        # snapshot only on the first cell so the whole stroke is one undo step
-        self.session.labels.assign(
-            block.block_id,
-            self.held_class_id,
-            self.classes_scheme.get_name(self.held_class_id),
-            snapshot=is_start,
-        )
+        record = self.session.labels.get_record(block.block_id)
+        if record.status == "nodata":
+            return
+        if erase:
+            if record.status not in ("labeled", "abstain"):
+                return
+            self.session.labels.clear(block.block_id, snapshot=not self._stroke_changed)
+        else:
+            if record.status == "labeled" and record.class_id == self.held_class_id:
+                return
+            self.session.labels.assign(
+                block.block_id, self.held_class_id,
+                self.classes_scheme.get_name(self.held_class_id),
+                snapshot=not self._stroke_changed,
+            )
+        self._stroke_changed = True
         self.session.mark_changed()
+        self._mark_unsaved_feedback()
         self._refresh_label_overlay()
 
     def _on_block_paint_end(self) -> None:
         """End of a drag-paint stroke: refresh history and autosave if completed."""
-        if self.held_class_id is None or not self.session:
+        if not self._stroke_changed or not self.session:
             return
+        self._stroke_changed = False
         self._refresh_history()
         self._maybe_save_completed_panel(self.current_panel_idx)
         self._maybe_autosave()
@@ -1733,7 +1872,7 @@ class MainWindow(QMainWindow):
         self.selection_rect = (r0, c0, r1, c1)
         n = (r1 - r0 + 1) * (c1 - c0 + 1)
         self.status_label.setText(
-            f"Selected {n} blocks — press a class key (q/w/e) to fill, or Esc to cancel"
+            f"Selected {n} blocks — class key to fill, Backspace to erase, Esc to cancel"
         )
 
     def _clear_selection(self) -> None:
@@ -1758,6 +1897,7 @@ class MainWindow(QMainWindow):
         if ids:
             count = self.session.labels.bulk_assign(ids, class_id, name)
             self.session.mark_changed(count)
+            self._mark_unsaved_feedback()
         if class_id >= 0:
             self.last_class_id = class_id
         self._clear_selection()
@@ -1766,6 +1906,23 @@ class MainWindow(QMainWindow):
         self._maybe_save_completed_panel(self.current_panel_idx)
         self._maybe_autosave()
         self.status_label.setText(f"Filled {len(ids)} blocks with {name}")
+
+    def _erase_selection(self):
+        if self.selection_rect is None or not self.session:
+            return
+        r0, c0, r1, c1 = self.selection_rect
+        ids = [b.block_id for (r, c), b in self._panel_block_map().items()
+               if r0 <= r <= r1 and c0 <= c <= c1 and b.w_px > 0 and b.h_px > 0]
+        count = self.session.labels.bulk_clear(ids)
+        self._clear_selection()
+        if count:
+            self.session.mark_changed(count)
+            self._mark_unsaved_feedback()
+        self._refresh_label_overlay()
+        self._refresh_history()
+        self._maybe_save_completed_panel(self.current_panel_idx)
+        self._maybe_autosave()
+        self.status_label.setText(f"Erased {count} blocks · Ctrl+Z to undo")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         """Handle keyboard input."""
@@ -1781,7 +1938,7 @@ class MainWindow(QMainWindow):
                 self._close_class_summary()
             return
 
-        if not event.isAutoRepeat():
+        if not event.isAutoRepeat() and not event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier):
             # Zoom ladder: in-panel magnify ↔ multi-panel zoom-out ↔ overview
             if event.key() in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
                 self._zoom_in()
@@ -1809,6 +1966,9 @@ class MainWindow(QMainWindow):
                 self._clear_selection()
                 self.status_label.setText("Selection cancelled")
                 return
+            if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+                self._erase_selection()
+                return
             cid = self._hotkey_class_id(event)
             if cid is not None:
                 self._fill_selection(cid)
@@ -1818,8 +1978,12 @@ class MainWindow(QMainWindow):
         if not event.isAutoRepeat():
             cid = self._class_id_for_event(event)
             if cid is not None:
+                if self.erase_button.isChecked():
+                    self.erase_button.click()
                 self.held_class_id = cid
                 self.last_class_id = cid
+            if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+                self._erase_key_held = True
 
         if self.controller and self.controller.handle_key_press(event):
             return
@@ -1828,6 +1992,8 @@ class MainWindow(QMainWindow):
     def keyReleaseEvent(self, event: QKeyEvent) -> None:
         """Release the drag-paint brush when its class key is let go."""
         if not event.isAutoRepeat():
+            if event.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+                self._erase_key_held = False
             cid = self._class_id_for_event(event)
             if cid is not None and cid == self.held_class_id:
                 self.held_class_id = None
@@ -1841,15 +2007,18 @@ class MainWindow(QMainWindow):
 
     def _on_labels_changed(self) -> None:
         """Callback: labels have changed, refresh the active view."""
-        if not self._save_failure_notified:
-            self.workspace_save_button.setText("Save predictions" if self.predictions_mode else "Save labels")
-            self.save_feedback_label.setText("Unsaved changes")
+        self._mark_unsaved_feedback()
         prev_panel = self.current_panel_idx  # panel the just-labeled block was in
         self._refresh_view()  # panel mode re-syncs current_panel_idx to the cursor
         self._refresh_history()
         # If that panel is now fully done (e.g. last block labeled), autosave it
         self._maybe_save_completed_panel(prev_panel)
         self._maybe_autosave()
+
+    def _mark_unsaved_feedback(self):
+        if not self._save_failure_notified:
+            self.workspace_save_button.setText("Save predictions" if self.predictions_mode else "Save labels")
+            self.save_feedback_label.setText("Unsaved changes")
 
     def _on_panel_changed_kb(self) -> None:
         """Callback: cursor rolled into another panel (auto-advance / PageUp). Just redraw."""
@@ -1929,6 +2098,7 @@ class MainWindow(QMainWindow):
         """Switch view mode and re-render. Resets zoom + selection."""
         if not self.session:
             return
+        self._on_block_paint_end()
         self.view_mode = mode
         self.canvas.zoom = 1
         self._clear_selection()
@@ -2149,7 +2319,9 @@ class MainWindow(QMainWindow):
         """Show keyboard shortcuts help dialog."""
         if not self.classes_scheme:
             return
-        dialog = HelpDialog(self.classes_scheme)
+        self.held_class_id = None
+        self._erase_key_held = False
+        dialog = HelpDialog(self.classes_scheme, parent=self, on_customize=self._customize_shortcuts)
         dialog.exec()
 
     # ------------------------------------------------------------------ #
@@ -2334,6 +2506,25 @@ class MainWindow(QMainWindow):
         if isinstance(self.history_panel, HistoryPanel):
             self.history_panel.set_current_panel(self.current_panel_idx)
             self.history_panel.refresh()
+        self._update_label_progress()
+
+    def _update_label_progress(self):
+        if not self.session:
+            return
+        counts = Counter(r.status for r in self.session.labels.records.values()
+                         if r.w_px > 0 and r.h_px > 0)
+        total = sum(counts.values())
+        labeled = counts["labeled"]
+        self.label_progress.setRange(0, max(1, total))
+        self.label_progress.setValue(labeled)
+        percent = 100 * labeled / total if total else 0
+        self.label_progress.setFormat(f"{labeled:,} / {total:,} blocks labeled ({percent:.1f}%)")
+        self.label_progress.setToolTip(
+            f"Whole observation · {total:,} blocks inside the image\n"
+            f"{labeled:,} labeled · {counts['abstain']:,} skipped · "
+            f"{counts['nodata']:,} no data · {counts['unlabeled']:,} remaining\n"
+            "Skipped and no-data blocks are not counted as labels. Empty padding outside the image is excluded."
+        )
 
     def _export(self) -> None:
         """Publish a fresh crop/label dataset from the current in-memory labels."""
@@ -2367,6 +2558,7 @@ class MainWindow(QMainWindow):
                 dialog = ExportDialog(
                     self.session.raster.path, snapshot, classes_path, out_dir,
                     self.session.grid, self.predictions_mode, self,
+                    reuse=self._crop_export_cache,
                 )
                 # Start after exec enters its event loop, so a fast failure cannot
                 # finish the dialog before it is shown.
@@ -2382,13 +2574,22 @@ class MainWindow(QMainWindow):
                 if result != QDialog.DialogCode.Accepted:
                     self.status_label.setText("Export cancelled. No dataset was published.")
                     return
+                exported = dialog.worker.export_result
+                self._crop_export_cache = exported.cache
+                out_dir = exported.folder
                 self.last_export_path = out_dir
-                count = dialog.worker.count
-            self.status_label.setText(f"Exported {count:,} crop/label pairs to {out_dir}")
+                count = exported.count
+            if exported.unchanged:
+                summary = f"Already up to date: verified {count:,} crop/label pairs."
+                details = "No labels changed. The existing export is complete; no new folder was created."
+            else:
+                summary = f"Exported and verified {count:,} crop/label pairs."
+                details = f"Crop images: {exported.reused:,} reused, {exported.created:,} newly generated."
+            self.status_label.setText(f"{summary} {details} {out_dir}")
             self.status_label.setToolTip(str(out_dir))
             QMessageBox.information(
-                self, "Export complete",
-                f"Exported and verified {count:,} crop/label pairs.\n\n{out_dir}\n\n"
+                self, "Export up to date" if exported.unchanged else "Export complete",
+                f"{summary}\n{details}\n\n{out_dir}\n\n"
                 "The folder includes native image crops, labels.csv, class definitions, "
                 "and loading instructions. Each label describes a whole block.",
             )
