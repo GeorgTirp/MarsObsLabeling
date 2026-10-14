@@ -268,6 +268,11 @@ def cached_prediction_workspace(workspace, monkeypatch):
     table = pq.read_table(workspace.parquet)
     metadata = json.loads(table.schema.metadata[METADATA_KEY])
     metadata.update(model_sig=model_sig, model_stem=model.stem)
+    metadata["inference_summary"] = {
+        "version": 1, "confidence": {"OBS_0_0": 0.8}, "gallery": {},
+        "block_classifier": False, "num_pixel_classes": 14,
+        "npca_error": "No calibration", "npca_signature": None,
+    }
     table = table.replace_schema_metadata({METADATA_KEY: json.dumps(metadata).encode()})
     pq.write_table(table, parquet)
     sidecar.write_text(json.dumps(metadata))
@@ -332,6 +337,31 @@ def test_matching_prediction_cache_resumes_without_inference(recovery_workspace,
     assert cache.win.labels_dir == cache.cache_dir
     assert cache.win._model_sig == cache.model_sig
     assert cache.win.save_predictions_button.isEnabled()
+    assert cache.win.block_confidence == {"OBS_0_0": 0.8}
+    assert cache.win.npca_error == "No calibration"
+    assert_originals_unchanged(originals)
+
+
+def test_old_cache_rebuilds_summary_without_overwriting_reviewed_labels(recovery_workspace, monkeypatch):
+    ws = recovery_workspace
+    cache = cached_prediction_workspace(ws, monkeypatch)
+    table = pq.read_table(cache.parquet)
+    metadata = json.loads(table.schema.metadata[METADATA_KEY])
+    del metadata["inference_summary"]
+    table = table.replace_schema_metadata({METADATA_KEY: json.dumps(metadata).encode()})
+    pq.write_table(table, cache.parquet)
+    cache.sidecar.write_text(json.dumps(metadata))
+    originals = saved_bytes(cache)
+    calls = []
+
+    def rebuild(path, signature, *, preserve_labels):
+        calls.append(preserve_labels)
+        assert cache.win.session.labels.get_record("OBS_0_0").class_id == 0
+
+    monkeypatch.setattr(cache.win, "_run_prediction", rebuild)
+    cache.win.load_for_inference(ws.source, cache.model)
+    assert calls == [True]
+    assert cache.win.session.labels.get_record("OBS_0_0").class_id == 0
     assert_originals_unchanged(originals)
 
 

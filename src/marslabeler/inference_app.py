@@ -15,7 +15,7 @@ def main():
         ),
     )
     parser.add_argument("jp2_path", help="Path to the JP2/GeoTIFF observation to predict on")
-    parser.add_argument("model_path", help="Path to the trained model checkpoint (.pt)")
+    parser.add_argument("model_path", help="Path to the model checkpoint (.pt) or a run folder containing best.pt")
     parser.add_argument(
         "--config",
         type=str,
@@ -88,6 +88,8 @@ def main():
 
     jp2_path = Path(args.jp2_path)
     model_path = Path(args.model_path)
+    if model_path.is_dir():
+        model_path = model_path / "best.pt"
     if not jp2_path.exists():
         parser.error(f"JP2 file not found: {jp2_path}")
     if not model_path.exists():

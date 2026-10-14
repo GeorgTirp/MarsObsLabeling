@@ -16,7 +16,6 @@ from marslabeler.classes import ClassScheme
 from marslabeler.inference.engine import (
     compute_global_quantization,
     run_block_inference_with_pixel_maps,
-    run_block_scores,
 )
 from marslabeler.io.raster import RasterSource
 from marslabeler.model.grid import BlockInfo
@@ -91,6 +90,10 @@ class PredictWorker(QThread):
         # Read by the dialog after finished_ok rather than sent through the
         # signal, so the existing 3-dict finished_ok contract is untouched.
         self.local_npca: dict = {}
+        self.npca_error = ""
+        # Stage-4 only: phi and logits per block (blockanalysis.BlockFeatures),
+        # so the Laplace and Mahalanobis maps need no second pass.
+        self.block_features = None
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -111,8 +114,13 @@ class PredictWorker(QThread):
             from marslabeler.inference.modelio import sidecar_path
             from vision_backend.pc_align.neural_pca import load_gallery_bases
 
-            bases = load_gallery_bases(sidecar_path(self.checkpoint_path, "npca.pt"))
+            path = sidecar_path(self.checkpoint_path, "npca.pt")
+            if not path.exists():
+                self.npca_error = f"Missing {path.name}. Add NPCA calibration fitted for this checkpoint."
+                return {}
+            bases = load_gallery_bases(path)
             if not bases:
+                self.npca_error = "This model's NPCA artifact contains no projection bases."
                 return {}
 
             embeddings, aligned = stack_block_embeddings(embedding_sink, self.blocks)
@@ -131,6 +139,7 @@ class PredictWorker(QThread):
                 embeddings, aligned, bases, weights, eligible_block_ids=eligible
             )
         except Exception as exc:  # optional feature -- never break inference
+            self.npca_error = str(exc)
             self.status.emit(f"Local Neural-PCA unavailable: {exc}")
             return {}
 
@@ -144,8 +153,7 @@ class PredictWorker(QThread):
             from marslabeler.inference.modelio import (
                 build_inference_plan,
                 load_model_bundle,
-                make_confidence_score_fn,
-                make_predict_fn_with_embeddings,
+                make_prediction_analysis_fn,
             )
 
             bundle = load_model_bundle(
@@ -185,8 +193,8 @@ class PredictWorker(QThread):
             # that produces the predictions (measured cost: within noise). These
             # feed the per-observation Neural-PCA gallery, so its thumbnails point
             # at blocks of THIS image instead of the training corpus.
-            predict_fn, embedding_sink = make_predict_fn_with_embeddings(
-                bundle, quantization_bounds
+            predict_fn, embedding_sink, confidence_sink, block_votes, logit_sink = make_prediction_analysis_fn(
+                bundle, quantization_bounds, blocks=self.blocks, plan=plan,
             )
             raw, raw_pixel_maps = run_block_inference_with_pixel_maps(
                 self.raster,
@@ -196,6 +204,16 @@ class PredictWorker(QThread):
                 progress_cb=progress_cb,
                 should_cancel=lambda: self._cancelled,
             )
+            self.is_block_classifier = bundle.block_classifier
+            self.num_pixel_classes = bundle.model.num_seg_classes if bundle.block_classifier else bundle.num_classes
+            if bundle.block_classifier:
+                raw = {b.block_id: int(vote) for b, vote in zip(self.blocks, block_votes)
+                       if b.w_px > 0 and b.h_px > 0}
+                from marslabeler.inference.blockanalysis import BlockFeatures
+
+                self.block_features = BlockFeatures.from_batches(
+                    self.blocks, embedding_sink, logit_sink, bundle.model
+                )
             self.local_npca = self._build_local_npca(bundle, embedding_sink, raw)
 
             if self._cancelled:
@@ -215,18 +233,10 @@ class PredictWorker(QThread):
                 mapped[block_id] = class_id
             pixel_maps = _remap_pixel_maps(raw_pixel_maps, model_index_to_id)
 
-            def confidence_progress_cb(done: int, total: int) -> None:
-                self.progress.emit(done, total)
-                self.status.emit(f"Scoring confidence: block {done}/{total}...")
-
-            confidence = run_block_scores(
-                self.raster,
-                self.blocks,
-                plan,
-                make_confidence_score_fn(bundle, quantization_bounds),
-                progress_cb=confidence_progress_cb,
-                should_cancel=lambda: self._cancelled,
-            )
+            confidence = {}
+            for block, score in zip(self.blocks, confidence_sink):
+                if np.isfinite(score):
+                    confidence[block.block_id] = float(score)
 
             self.status.emit(f"Predicted {len(mapped)} blocks")
             self.finished_ok.emit(mapped, confidence, pixel_maps)
@@ -305,6 +315,9 @@ class PredictDialog(QDialog):
         self.pixel_predictions = pixel_predictions
         # Built during the same pass; {} when the checkpoint has no PCA bases.
         self.local_npca = getattr(self.worker, "local_npca", {}) or {}
+        self.npca_error = self.worker.npca_error
+        self.is_block_classifier = getattr(self.worker, "is_block_classifier", False)
+        self.num_pixel_classes = getattr(self.worker, "num_pixel_classes", 0)
         if predictions:
             self.accept()
         else:
@@ -324,6 +337,10 @@ class PredictDialog(QDialog):
     def get_local_npca(self) -> dict:
         """class_id -> component -> ranked blocks of THIS observation ({} if unavailable)."""
         return getattr(self, "local_npca", {})
+
+    def get_block_features(self):
+        """Stage-4 phi and logits per block (blockanalysis.BlockFeatures), else None."""
+        return self.worker.block_features
 
     def get_pixel_predictions(self) -> dict[str, np.ndarray]:
         """block_id -> (h_px, w_px) uint8 per-pixel predicted class-id crop

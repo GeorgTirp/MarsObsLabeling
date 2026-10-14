@@ -104,9 +104,8 @@ def build_local_gallery(
 
         rows = list(range(len(blocks)))
         if eligible_block_ids is not None:
-            allowed = eligible_block_ids.get(int(class_id))
-            if allowed is not None:
-                rows = [i for i in rows if getattr(blocks[i], "block_id", None) in allowed]
+            allowed = eligible_block_ids.get(int(class_id), set())
+            rows = [i for i in rows if getattr(blocks[i], "block_id", None) in allowed]
         if not rows:
             continue
 
@@ -150,6 +149,10 @@ def classifier_weight_vectors(model, class_ids: Sequence[int]) -> dict[int, np.n
 
     weights: dict[int, np.ndarray] = {}
     for class_id in class_ids:
+        if hasattr(model, "fc") and hasattr(model, "seg"):
+            if 0 <= int(class_id) < model.fc.out_features:
+                weights[int(class_id)] = model.fc.weight[int(class_id)].detach().float().cpu().numpy()
+            continue
         try:
             w = get_classifier_weight_vector(model, int(class_id))
         except ValueError:

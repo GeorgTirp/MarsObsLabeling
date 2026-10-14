@@ -100,6 +100,32 @@ class ModelBundle:
     device: Any  # torch.device
     checkpoint_path: Path
     raw_config: dict
+    block_classifier: bool = False
+    # How non-uint8 imagery is mapped to uint8; see engine.quantize_to_uint8.
+    input_stretch: str = "full"
+    # Softmax temperature for calibrated block probabilities (1.0 = raw softmax).
+    temperature: float = 1.0
+
+
+def read_temperature(checkpoint_path: str | Path) -> float:
+    """T* from the `eval.json` written next to a Stage-4 checkpoint, else 1.0.
+
+    The file names the checkpoint it was evaluated for; a temperature fitted for
+    another checkpoint in the same folder must not calibrate this one.
+    """
+    import json
+    import math
+
+    checkpoint_path = Path(checkpoint_path)
+    try:
+        evaluation = json.loads((checkpoint_path.parent / "eval.json").read_text())
+        temperature = float(evaluation["temperature"])
+        evaluated = Path(str(evaluation.get("checkpoint", checkpoint_path.name))).name
+    except (OSError, ValueError, KeyError, TypeError):
+        return 1.0
+    if evaluated != checkpoint_path.name or not math.isfinite(temperature) or temperature <= 0:
+        return 1.0
+    return temperature
 
 
 def sidecar_path(checkpoint_path: str | Path, suffix: str) -> Path:
@@ -179,11 +205,15 @@ def resolve_training_imagery_path(
     except Exception:
         return None
     config = checkpoint.get("config", {}) or {}
+    root = _resolve_ai4exomars_root(ai4exomars_path)
+    block_imagery = (checkpoint.get("args", {}) or {}).get("imagery_path")
+    if block_imagery:
+        candidate = _resolve_relative_to(block_imagery, root)
+        return candidate if candidate.exists() else None
     loader_config_path = (config.get("data", {}) or {}).get("loader_config_path")
     if not loader_config_path:
         return None
 
-    root = _resolve_ai4exomars_root(ai4exomars_path)
     loader_config_file = _resolve_relative_to(loader_config_path, root)
     if not loader_config_file.exists():
         return None
@@ -205,7 +235,7 @@ def load_model_bundle(
     device: str = "auto",
     ai4exomars_path: str | None = None,
 ) -> ModelBundle:
-    """Load a stage-3 segmentation checkpoint and reconstruct the matching model."""
+    """Reconstruct a Stage-3 segmenter or Stage-4 block classifier strictly."""
     import torch
 
     _ensure_vision_backend_importable(ai4exomars_path)
@@ -213,7 +243,41 @@ def load_model_bundle(
     from vision_backend.training.utils import select_device
 
     checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.is_dir():
+        checkpoint_path = checkpoint_path / "best.pt"
     torch_device = select_device(torch) if device == "auto" else torch.device(device)
+    checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    if "block_state" in checkpoint:
+        try:
+            from vision_backend.model.block_head import BlockClassifier
+        except ImportError as exc:
+            raise VisionBackendNotFound(
+                "This is a Stage-4 block-classifier checkpoint. Update the AI4ExoMars "
+                "checkout to include vision_backend/model/block_head.py, or use "
+                "--ai4exomars-path with that checkout."
+            ) from exc
+        from vision_backend.training.builders import build_simmim_segmentation_model
+        config = checkpoint["seg_model_config"]
+        segmenter = build_simmim_segmentation_model(config)
+        head = checkpoint["head_config"]
+        model = BlockClassifier(
+            segmenter, checkpoint["classes"]["seg_index"],
+            attn_hidden=head["attn_hidden"], dropout=head["dropout"],
+            tile_size=head.get("tile_size", 512),
+        )
+        model.load_state_dict(checkpoint["block_state"], strict=True)
+        model.to(torch_device).eval()
+        return ModelBundle(
+            model=model, model_kind="simmim", num_classes=model.num_classes,
+            required_stride=model.tile_size or 256, needs_context=False,
+            device=torch_device, checkpoint_path=checkpoint_path,
+            raw_config={"model": config, "classes": checkpoint["classes"],
+                        "args": checkpoint.get("args", {}), "head_config": head},
+            block_classifier=True,
+            # Stage-4 training crops were stretched onto the Oxia percentiles.
+            input_stretch="oxia",
+            temperature=read_temperature(checkpoint_path),
+        )
     model, model_kind, num_classes, config = load_segmentation_model_from_checkpoint(
         checkpoint_path, device=torch_device
     )
@@ -260,6 +324,7 @@ def build_inference_plan(
         context_px=context_px,
         batch_size=max(1, batch_size),
         native_window=native_window,
+        clip_to_block=bundle.block_classifier,
     )
 
 
@@ -297,7 +362,7 @@ def _to_tensor(bundle: ModelBundle, batch: np.ndarray, quantization_bounds: tupl
             )
         from marslabeler.inference.engine import quantize_to_uint8
 
-        batch = quantize_to_uint8(batch, quantization_bounds)
+        batch = quantize_to_uint8(batch, quantization_bounds, stretch=bundle.input_stretch)
     x = batch.astype(np.float32) / 127.5 - 1.0
     tensor = torch.from_numpy(x).unsqueeze(1)  # (N, 1, H, W)
     return tensor.to(bundle.device)
@@ -310,6 +375,11 @@ def _forward_logits(
     quantization_bounds: tuple[float, float] | None,
 ):
     local_tensor = _to_tensor(bundle, local_batch, quantization_bounds)
+    if bundle.block_classifier:
+        import torch
+        from marslabeler.io.preprocess import compute_invalid_mask
+        valid = np.stack([~compute_invalid_mask(pixels) for pixels in local_batch])
+        return bundle.model(local_tensor, torch.from_numpy(valid).unsqueeze(1).to(bundle.device))
     if bundle.needs_context:
         if context_batch is None:
             raise ValueError(f"model_kind={bundle.model_kind!r} requires a context crop")
@@ -436,6 +506,72 @@ def make_confidence_score_fn(bundle: ModelBundle, quantization_bounds: tuple[flo
     return score_fn
 
 
+def make_prediction_analysis_fn(bundle: ModelBundle, quantization_bounds=None, *, blocks=None, plan=None):
+    """Collect classes, confidence and NPCA inputs in one model pass.
+
+    A Stage-4 model has an 18-class block decision and a separate, fine-tuned
+    segmentation head. Preserve that distinction: its block vote is never
+    inferred from the smaller segmentation head's pixel classes.
+
+    For a Stage-4 model, ``embeddings`` collects phi (the input of the head's
+    last layer) and ``block_logits`` the block logits, one [batch, ...] array per
+    batch -- everything the block-level Laplace and Mahalanobis scores need, so
+    those maps never need a second pass. Confidence is the temperature-scaled
+    max probability.
+    """
+    import torch
+    import torch.nn.functional as F
+    from marslabeler.inference.engine import _block_crop
+    from marslabeler.io.preprocess import compute_invalid_mask
+
+    embeddings, confidence, block_votes, block_logits = [], [], [], []
+    model = bundle.model
+    segmenter = model.seg if bundle.block_classifier else model
+
+    def predict(local, context):
+        captured = {}
+        def seg_hook(module, args, output):
+            captured["features"] = args[0]
+            captured["pixels"] = output
+        def fc_hook(module, args):
+            captured["embedding"] = args[0]
+        handles = [segmenter.decoder.head.register_forward_hook(seg_hook)]
+        if bundle.block_classifier:
+            handles.append(model.fc.register_forward_pre_hook(fc_hook))
+        try:
+            with torch.no_grad():
+                logits = _forward_logits(bundle, local, context, quantization_bounds)
+                if bundle.block_classifier:
+                    embeddings.append(captured["embedding"].float().cpu().numpy())
+                    block_logits.append(logits.float().cpu().numpy())
+                    block_votes.extend(logits.argmax(1).cpu().tolist())
+                    calibrated = (logits.float() / bundle.temperature).softmax(1)
+                    confidence.extend(calibrated.max(1).values.cpu().tolist())
+                    pixels = F.interpolate(captured["pixels"].float(), size=local.shape[-2:],
+                                           mode="bilinear", align_corners=False)
+                    # Segmenter channels can map to arbitrary block-class indices.
+                    ids = [bundle.model.seg_index.index(i) for i in range(pixels.shape[1])]
+                    mapping = torch.tensor(ids, device=pixels.device)
+                    return mapping[pixels.argmax(1)].cpu().numpy()
+                embeddings.append(captured["features"].mean(dim=(2, 3)).float().cpu().numpy())
+                scores = logits.float().softmax(1).max(1).values.cpu().numpy()
+                # Retain only a scalar per block, not another observation-sized
+                # float raster. Summaries need no second model pass.
+                first = len(confidence)
+                for index, (pixels, score) in enumerate(zip(local, scores)):
+                    valid = ~compute_invalid_mask(pixels)
+                    if blocks is not None and plan is not None:
+                        score = _block_crop(score, blocks[first + index], plan)
+                        valid = _block_crop(valid, blocks[first + index], plan)
+                    confidence.append(float(score[valid].mean()) if valid.any() else float("nan"))
+                return logits.argmax(1).cpu().numpy()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    return predict, embeddings, confidence, block_votes, block_logits
+
+
 def load_uncertainty_stats(path: str | Path, ai4exomars_path: str | None = None):
     """Load a fitted `MahalanobisStats` artifact (see `uncertainty/fit_gaussians.py`).
 
@@ -450,13 +586,17 @@ def load_uncertainty_stats(path: str | Path, ai4exomars_path: str | None = None)
 
 
 def make_uncertainty_score_fn(
-    bundle: ModelBundle, stats, quantization_bounds: tuple[float, float] | None = None
+    bundle: ModelBundle, stats, quantization_bounds: tuple[float, float] | None = None,
+    *, normalize: bool = True,
 ):
     """Numpy-in/numpy-out epistemic (Mahalanobis) uncertainty, normalized to [0, 1],
     for `inference.engine.run_block_scores`. Requires fitted `stats` (see
     `load_uncertainty_stats` / `sidecar_path`)."""
     import torch
     from vision_backend.uncertainty.uncertainty_mapping import epistemic_uncertainty_map
+    from vision_backend.uncertainty.malahanobis import mahalanobis_distance_map
+
+    stats = stats.to(bundle.device)
 
     def score_fn(local_batch: np.ndarray, context_batch: np.ndarray | None) -> np.ndarray:
         local_tensor = _to_tensor(bundle, local_batch, quantization_bounds)
@@ -466,7 +606,18 @@ def make_uncertainty_score_fn(
                 raise ValueError(f"model_kind={bundle.model_kind!r} requires a context crop")
             inputs = (local_tensor, _to_tensor(bundle, context_batch, quantization_bounds))
         with torch.no_grad():
-            heat = epistemic_uncertainty_map(bundle.model, *inputs, stats=stats, normalize=True)
+            if bundle.block_classifier:
+                # Use the block model's tiled feature extraction, just as its
+                # predictions do for inputs larger than the training tile size.
+                features = bundle.model.decode_features(local_tensor)
+                features = torch.nn.functional.interpolate(
+                    features, size=local_tensor.shape[-2:], mode="bilinear", align_corners=False
+                )
+                heat = mahalanobis_distance_map(features, stats)
+                if normalize:
+                    heat = (heat / max(stats.reference_max_distance or 1.0, 1e-8)).clamp(0, 1)
+            else:
+                heat = epistemic_uncertainty_map(bundle.model, *inputs, stats=stats, normalize=normalize)
             return heat.to("cpu").numpy().astype(np.float32)
 
     return score_fn

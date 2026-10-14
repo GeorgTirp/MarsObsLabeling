@@ -82,18 +82,20 @@ mars-label --help
 
 ## Inference (`mars-inference`)
 
-`mars-inference` runs a trained AI4ExoMars segmentation checkpoint over a HiRISE
+`mars-inference` runs a trained AI4ExoMars segmentation or block-classification checkpoint over a HiRISE
 observation and opens the predictions in the same window as `mars-label` — same
 panels, same grid, same hotkeys — so a prediction is just a labeling session with a
 head start. It is the ML counterpart to `mars-label`; nothing about labeling changes.
 
 ```bash
 mars-inference /path/to/file.jp2 /path/to/model.pt
+# A training run directory selects its best.pt:
+mars-inference /path/to/file.jp2 ../v2_final_lr3_e12
 ```
 
 What happens:
 1. **Preprocessing** — same nodata/skip-detection pass as `mars-label` (progress bar); off-swath blocks are never sent through the model.
-2. **Inference** — the checkpoint's model is reconstructed and run block-by-block over the observation, with a progress bar (`block N/M`). Each block gets one class: the model's per-pixel argmax, majority-voted across the block.
+2. **Inference** — the checkpoint's model is reconstructed and run block-by-block over the observation, with a progress bar (`block N/M`). Stage-3 models use a majority vote of pixel predictions. Stage-4 models use their trained block classifier directly, including the newly learned classes.
 3. **Review** — the window opens exactly like `mars-label`, with predicted blocks pre-colored by class. Relabel any block with the normal hotkeys; a block you edit gets `edit_count > 0` in the saved Parquet, so reviewed/edited predictions stay distinguishable from untouched model output.
 4. **Save predictions** — press the header or sidebar's **Save predictions** button to persist the current (possibly reviewed) predictions.
 
@@ -105,6 +107,13 @@ model, so several models' predictions for the same image coexist. Re-running
 `mars-inference` on the same `(image, model)` pair loads the cached result instead of
 calling the model again; if the checkpoint file's size/mtime changed since the cache
 was written, it's treated as stale and inference reruns automatically.
+
+For a checkpoint called `best.pt`, the folder is `<run_directory>-best` to keep
+different training runs separate. Saved predictions include confidence and the
+observation's NPCA rankings. Old caches without summaries rebuild these automatically,
+preserving reviewed labels. A changed NPCA sidecar also triggers rebuilding.
+Pixel classification maps are temporary and require **Re-run inference** after
+reopening a saved session. Uncertainty maps are always computed on demand.
 
 ### Continuing in labeling mode
 
@@ -123,12 +132,18 @@ doesn't match your class ids 1:1. See the comment in `configs/classes.yaml`.
 
 ### Model code (AI4ExoMars)
 
-`mars-inference` reconstructs the model architecture from the checkpoint itself (it
-expects the `{"model_state", "config": {"model": {...}}}` format written by
-`AI4ExoMars/vision_backend/train_stage3_segmentation_finetune.py`) using the
+`mars-inference` reconstructs the model architecture from the checkpoint itself:
+Stage-3 `model_state` / `config` and Stage-4 `block_state` / `seg_model_config` /
+`head_config` / `classes` are supported. It uses the
 `vision_backend` package from [AI4ExoMars](../AI4ExoMars). It looks for that package
 already installed, then for a sibling `../AI4ExoMars` checkout; point it elsewhere
 with `--ai4exomars-path` or `configs/app.yaml`'s `inference.ai4exomars_path`.
+
+Stage-4 needs a recent backend containing `vision_backend/model/block_head.py`.
+For `v2_final_lr3_e12`, the default view shows all 18 block classes. Its optional
+pixel classification view uses the fine-tuned **14-class segmentation backbone**;
+the four additional block classes have no pixel classifier. The UI distinguishes
+these views rather than painting a block decision as a pixel prediction.
 
 AI4ExoMars trains on 8-bit (uint8, 0 = nodata) imagery. Non-uint8 rasters (e.g.
 16-bit HiRISE RDR) are handled too — see [Non-8-bit imagery](#non-8-bit-imagery)
@@ -167,6 +182,12 @@ Rectified Graphic) training-imagery pipeline, which involves cartographic
 processing there's no exact recipe to replicate from raw calibrated data. Status
 bar reports when it kicks in.
 
+Stage-3 models get the 1st/99th percentiles mapped onto 0–255. Stage-4 block
+classifiers get them mapped onto the Oxia training percentiles 58/178 instead
+(clipped to 1–255, 0 kept for nodata), exactly as their expert training crops
+were made (`to_uint8(..., stretch="oxia")` in AI4ExoMars). The 0–255 stretch has
+about twice that contrast and quietly degrades a block classifier's predictions.
+
 ### Configuration
 
 ```yaml
@@ -180,25 +201,65 @@ inference:
 
 ## Analysis Layers (predictions mode)
 
-Two extra ways to look at a model, beyond its class predictions. Both build on
-analysis code in `AI4ExoMars/vision_backend` (`uncertainty/` and `pc_align/`).
+Separate spatial maps and a class summary are available in predictions mode.
 
-### Uncertainty Heatmap
+### Mahalanobis distance and Laplace uncertainty
 
-The **Uncertainty heatmap** button (right panel, predictions mode only) swaps
-the class-color overlay for a per-block heatmap (blue = confident, red =
-uncertain) of *epistemic* uncertainty — Mahalanobis distance from the model's
-feature representation to the nearest class's fitted Gaussian, a standard
-out-of-distribution (OOD) detector. This needs a calibration artifact fitted
-offline from a trained checkpoint (`AI4ExoMars/vision_backend/uncertainty/fit_gaussians.py`),
-conventionally saved as `<checkpoint_stem>.uncertainty.pt` next to the checkpoint.
-Until that exists for a given model, the button reports so clearly (with the
-command to fit it) instead of guessing.
+**Mahalanobis distance** and **Laplace uncertainty** each compute their map only
+on the first click, then reuse it during that session.
+
+#### Stage-4 block classifiers (one score per block)
+
+Both maps score the 18-class block decision, from φ — the input of the block
+head's last layer — which the prediction pass keeps for every block. A click
+therefore costs about a millisecond per block, with no second model pass.
+**Save predictions** also writes φ (`<obs>.block_features.npz`), so a cached
+reload draws the maps without the model too. Only for a reload of predictions
+saved before this file existed is φ extracted again, in one pass, on first click.
+
+- **Laplace uncertainty** (`<checkpoint_stem>.laplace.pt`, the last-layer Laplace
+  from AI4ExoMars `uncertainty/block_laplace.py`): Monte Carlo (1000 draws)
+  predictive entropy divided by log(number of classes), 0–1. The best of the
+  model's scores at flagging likely misclassifications.
+- **Mahalanobis distance** (`<checkpoint_stem>.uncertainty.pt`, fitted on φ):
+  distance to the nearest class Gaussian divided by the file's reference
+  distance, the 95th percentile of the training blocks. Blue 0, yellow 1, red ≥ 2:
+  above 1 is unlike nearly every training block (another site measures ≈ 2).
+
+A run folder such as `v2_final_lr3_e12/` holds both files next to `best.pt`.
+Its `segmenter.*` files describe the segmentation backbone alone and are not used.
+
+#### Stage-3 segmentation models (pixel maps)
+
+Both maps retain spatial variation
+within blocks and align to the image's native pixel grid. Missing imagery stays
+transparent. Maps are stored in temporary files to limit RAM and open file handles.
+Pixel detail comes from the segmentation backbone's spatial features, upsampled
+from decoder resolution; it does not imply an independent measurement at each
+native HiRISE pixel or pixel predictions for the four new block classes.
+
+Mahalanobis uses `<checkpoint_stem>.uncertainty.pt`, fitted for this checkpoint's
+**spatial** feature distribution. It displays the raw distance to the nearest fitted
+class Gaussian, using one fixed calibration scale across the image. Blue means
+lower distance, red higher distance; it is not a probability of being wrong.
+The backend's Stage-3 fitting script is `uncertainty/fit_gaussians.py`.
+
+Laplace uses `<checkpoint_stem>.laplace.pt`. The supported spatial format is
+`mars-spatial-laplace-diag-v1`: a dictionary with `checkpoint_sha256`, `head_name`
+(`decoder.head`), and
+`posterior_variance` containing the fitted diagonal weight/bias posterior variances
+in the head's parameter shapes. The checkpoint is the posterior mean. The map
+estimates normalized mutual information from 64 shared posterior classifier draws,
+with one backbone pass per batch. Other fitted formats need a verified adapter;
+a training Laplace/EWC prior is **not** this posterior. Missing or incompatible
+calibration is reported explicitly. No fitted artifact is bundled with the GUI.
 
 Separately, every `mars-inference` run also computes per-block **softmax
-confidence** (`1 - max_softmax`) — no calibration needed, available for any
-model — feeding the Summary window's confidence stat even before an uncertainty
-artifact exists.
+confidence** (`max_softmax`) during the prediction pass. For a Stage-4 model it
+is calibrated: softmax(logits / T*), with T* read from the run folder's
+`eval.json` (1.0 if that file is missing or names another checkpoint).
+Confidence, coverage and the Neural-PCA gallery are ready immediately after
+inference, without computing either uncertainty map.
 
 ### Class Summary
 
@@ -210,12 +271,18 @@ every configured class:
   about this class"). Loaded from `<checkpoint_stem>.npca.pt`, fitted offline by
   `AI4ExoMars/vision_backend/pc_align/fit_neural_pca.py`; shown as a clearly
   labeled placeholder until that artifact exists.
+  The observation's own blocks are ranked during inference using the stored bases.
+  Stage-4 requires bases fitted to its 270-dimensional block-head input; these
+  explain the learned linear contribution to its block logits (the segmentation
+  prior is an additional contribution). A Stage-3 256-dimensional basis is not
+  interchangeable. Unavailable projections show their reason in the summary.
 - **Coverage** — % of this observation's blocks currently classified as this
   class. Always real: pure label-store arithmetic, works in plain `mars-label`
   sessions too (no model needed).
-- **Avg. softmax confidence** / **Avg. epistemic uncertainty** — mean per-block
-  scores from the last inference / uncertainty-heatmap run in this window.
-  "N/A" until that's been run at least once.
+- **Avg. softmax confidence** (calibrated for Stage-4), **Mean Mahalanobis
+  distance**, and **Mean Laplace uncertainty** — confidence is ready after
+  inference; each uncertainty statistic becomes available once its corresponding
+  map has been computed.
 
 ## Labeling Workflow
 

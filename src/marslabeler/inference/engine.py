@@ -51,6 +51,7 @@ class InferencePlan:
     context_px: int = 0
     batch_size: int = 4
     native_window: int = 0  # 0 -> same as pad_size (no scale correction)
+    clip_to_block: bool = False  # block classifiers must not pool neighbouring blocks
 
     @property
     def read_window_px(self) -> int:
@@ -123,6 +124,12 @@ def _iter_batches(
                 for b in batch
             ]
         )
+        if plan.clip_to_block:
+            for pixels, block in zip(local_stack, batch):
+                height = max(0, round(block.h_px * plan.model_px_per_native_px))
+                width = max(0, round(block.w_px * plan.model_px_per_native_px))
+                pixels[height:, :] = 0
+                pixels[:, width:] = 0
 
         context_stack = None
         if plan.needs_context:
@@ -222,19 +229,58 @@ def run_block_scores(
 
     Returns block_id -> mean score.
     """
+    results, _ = run_block_scores_with_pixel_maps(
+        raster, blocks, plan, score_fn, progress_cb, should_cancel,
+        keep_pixel_maps=False, mask_nodata=False,
+    )
+    return results
+
+
+def run_block_scores_with_pixel_maps(
+    raster: RasterLike,
+    blocks: Sequence[BlockInfo],
+    plan: InferencePlan,
+    score_fn: ScoreFn,
+    progress_cb=None,
+    should_cancel=None,
+    *,
+    keep_pixel_maps: bool = True,
+    mask_nodata: bool = True,
+    map_store=None,
+) -> tuple[dict[str, float], dict[str, np.ndarray]]:
+    """Keep spatial scores at native image coordinates as well as their means.
+
+    No-data pixels are NaN (transparent in the GUI), not zero uncertainty.
+    Both maps and means cover only the block's own extent, excluding context
+    and padding. The nearest resampling preserves missing-pixel boundaries.
+    """
     results: dict[str, float] = {}
+    maps = map_store if map_store is not None else {}
     for batch, local_stack, context_stack in _iter_batches(
         raster, blocks, plan, progress_cb, should_cancel
     ):
         scored = score_fn(local_stack, context_stack)
-        if scored.shape[0] != len(batch):
+        if scored.ndim != 3 or scored.shape[0] != len(batch):
             raise ValueError(
-                f"score_fn returned {scored.shape[0]} results for a batch of {len(batch)} blocks"
+                f"score_fn returned shape {scored.shape}; expected [batch, height, width] "
+                f"for {len(batch)} blocks"
             )
-        for block, pixel_scores in zip(batch, scored):
-            crop = _block_crop(pixel_scores, block, plan)
-            results[block.block_id] = float(np.mean(crop)) if crop.size else 0.0
-    return results
+        for block, pixels, pixel_scores in zip(batch, local_stack, scored):
+            crop = _block_crop(pixel_scores, block, plan).astype(np.float32, copy=True)
+            if not crop.size:
+                continue
+            if mask_nodata:
+                invalid = _block_crop(compute_invalid_mask(pixels), block, plan)
+                if invalid.shape != crop.shape:
+                    raise ValueError("Score maps must have the same spatial resolution as model inputs.")
+                crop[invalid] = np.nan
+            native = _to_native_resolution(crop, block)
+            valid = np.isfinite(native)
+            if valid.any():
+                results[block.block_id] = float(native[valid].mean())
+            if keep_pixel_maps:
+                maps[block.block_id] = native
+    return results, maps
 
 
 def compute_global_quantization(
@@ -268,9 +314,31 @@ def compute_global_quantization(
     return float(p_low), float(p_high)
 
 
-def quantize_to_uint8(batch: np.ndarray, bounds: tuple[float, float]) -> np.ndarray:
-    """Rescale a non-uint8 window into uint8 [0,255] using fixed (p_low, p_high) bounds."""
+# 1st/99th percentiles of the Oxia Planum DRG mosaic the AI4ExoMars models were
+# trained on (AI4ExoMars scripts/prep_expert_block_manifest.py OXIA_P1_P99).
+OXIA_P1_P99 = (58.0, 178.0)
+
+
+def quantize_to_uint8(
+    batch: np.ndarray, bounds: tuple[float, float], *, stretch: str = "full"
+) -> np.ndarray:
+    """Rescale a non-uint8 window into uint8 using fixed (p_low, p_high) bounds.
+
+    ``stretch="full"`` maps the bounds onto 0..255. ``stretch="oxia"`` maps them
+    onto the Oxia training percentiles instead, keeping 0 for nodata only --
+    exactly `to_uint8(..., stretch="oxia")`, which built the Stage-4 block
+    classifiers' training crops. The full stretch has about twice that contrast,
+    which degrades those models' predictions without any visible error.
+    """
     p_low, p_high = bounds
+    if stretch == "oxia":
+        unit = (batch.astype(np.float64) - p_low) / (p_high - p_low)
+        low, high = OXIA_P1_P99
+        out = np.clip(np.rint(low + unit * (high - low)), 1, 255).astype(np.uint8)
+        out[batch == 0] = 0
+        return out
+    if stretch != "full":
+        raise ValueError(f"Unknown input stretch {stretch!r} (full | oxia)")
     clipped = np.clip(batch.astype(np.float64), p_low, p_high)
     return ((clipped - p_low) / (p_high - p_low) * 255.0).round().astype(np.uint8)
 

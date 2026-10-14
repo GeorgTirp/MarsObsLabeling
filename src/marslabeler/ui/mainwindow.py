@@ -89,9 +89,20 @@ class MainWindow(QMainWindow):
         # the per-block data behind it. All empty/None until inference actually runs
         # (or, for npca_gallery, until a calibration artifact is found) -- see
         # load_for_inference(), _run_prediction(), _toggle_uncertainty_layer().
-        self.display_layer = "classes"  # "classes" | "uncertainty"
+        self.display_layer = "classes"  # "classes" | "uncertainty" | "laplace"
         self.block_confidence: dict[str, float] = {}  # block_id -> mean softmax confidence
         self.block_uncertainty: dict[str, float] = {}  # block_id -> mean epistemic (Mahalanobis) uncertainty
+        self.pixel_uncertainty = {}
+        self.block_laplace = {}
+        self.pixel_laplace = {}
+        self.mahalanobis_maximum = 1.0
+        # Stage-4 phi/logits per block (inference.blockanalysis.BlockFeatures):
+        # both uncertainty maps of a block classifier are computed from these.
+        self.block_features = None
+        self.is_block_classifier = False
+        self.npca_error = ""
+        self._inference_summary = None
+        self.num_pixel_classes = 0
         self.npca_gallery: Optional[dict] = None  # class model_index -> component -> ranked thumbnails
         # Same shape, but ranked over THIS observation's blocks (built during
         # the prediction pass); its items carry block ids, so clicking one
@@ -227,12 +238,24 @@ class MainWindow(QMainWindow):
 
         # Only shown in predictions mode (mars-inference): toggles the class-color
         # overlay for a Mahalanobis-distance epistemic-uncertainty heatmap.
-        self.uncertainty_button = QPushButton("Uncertainty heatmap")
+        self.uncertainty_button = QPushButton("Mahalanobis distance")
         self.uncertainty_button.setEnabled(False)
         self.uncertainty_button.setCheckable(True)
         self.uncertainty_button.setVisible(self.predictions_mode)
         self.uncertainty_button.clicked.connect(self._toggle_uncertainty_layer)
         right_layout.addWidget(self.uncertainty_button)
+        self.laplace_button = QPushButton("Laplace uncertainty")
+        self.laplace_button.setEnabled(False)
+        self.laplace_button.setCheckable(True)
+        self.laplace_button.setVisible(self.predictions_mode)
+        self.laplace_button.setToolTip("Compute the Laplace uncertainty map on first click")
+        self.laplace_button.clicked.connect(self._toggle_laplace_layer)
+        right_layout.addWidget(self.laplace_button)
+        self.analysis_legend = QLabel("")
+        self.analysis_legend.setWordWrap(True)
+        self.analysis_legend.setProperty("role", "muted")
+        self.analysis_legend.setVisible(False)
+        right_layout.addWidget(self.analysis_legend)
 
         # Only shown in predictions mode: pixel-wise (raw per-pixel model output,
         # the default) vs. blockwise (LabelStore's solid-per-block class, same
@@ -882,6 +905,18 @@ class MainWindow(QMainWindow):
                 self.display_layer = "classes"
                 self.block_confidence = {}
                 self.block_uncertainty = {}
+                self.pixel_uncertainty = {}
+                self.block_laplace = {}
+                self.pixel_laplace = {}
+                self.mahalanobis_maximum = 1.0
+                self.block_features = None
+                self.is_block_classifier = False
+                self.num_pixel_classes = 0
+                self.npca_error = ""
+                self._inference_summary = None
+                self.laplace_button.setChecked(False)
+                self.laplace_button.setEnabled(False)
+                self.analysis_legend.setVisible(False)
                 self.uncertainty_button.setChecked(False)
                 self.uncertainty_button.setEnabled(False)
                 self.prediction_render_mode = "pixelwise"
@@ -999,7 +1034,10 @@ class MainWindow(QMainWindow):
         if not self.predictions_mode:
             raise RuntimeError("load_for_inference requires predictions_mode=True")
 
-        model_id = model_path.stem
+        model_path = Path(model_path)
+        if model_path.is_dir():
+            model_path = model_path / "best.pt"
+        model_id = f"{model_path.parent.name}-{model_path.stem}" if model_path.stem == "best" else model_path.stem
         model_sig = self._model_signature(model_path)
         previous_session = self.session
         previous_settings = self.model_path, self.labels_dir, self.config.labeler
@@ -1041,19 +1079,37 @@ class MainWindow(QMainWindow):
 
         self.save_predictions_button.setEnabled(True)
         self.uncertainty_button.setEnabled(True)
+        self.laplace_button.setEnabled(True)
+        self.uncertainty_button.setToolTip("Compute the Mahalanobis distance map on first click")
 
         self.rerun_button.setEnabled(True)
         if cache_valid:
             self._model_sig = model_sig
-            note = (
-                "Pixel-wise view, per-block confidence and this observation's "
-                "Neural-PCA gallery are rebuilt by the inference pass and are not "
-                "stored in the prediction cache -- use \u21BB Re-run inference "
-                "for them."
-            )
-            self.render_mode_button.setToolTip(note)
-            self.uncertainty_button.setToolTip(note)
-            self.status_label.setText(f"Loaded cached predictions ({model_id}) for {obs_id}")
+            from marslabeler.inference.summarycache import decode_summary
+            summary = decode_summary(saved.get("inference_summary"),
+                                     checkpoint=model_path, grid=self.session.grid)
+            if summary is None:
+                self.status_label.setText("Rebuilding the summary; keeping all reviewed labels...")
+                self._run_prediction(model_path, model_sig, preserve_labels=True)
+                return
+            self.block_confidence = summary["confidence"]
+            self.local_npca_gallery = summary["gallery"]
+            self.is_block_classifier = summary["block_classifier"]
+            self.num_pixel_classes = summary["num_pixel_classes"]
+            self.npca_error = summary["npca_error"]
+            self._inference_summary = saved["inference_summary"]
+            if self.is_block_classifier:
+                from marslabeler.inference.blockanalysis import BlockFeatures, features_path
+                # None (an older save) only means the first map click re-extracts phi.
+                self.block_features = BlockFeatures.load(
+                    features_path(self.labels_dir, obs_id), model_sig,
+                    {b.block_id for b in self.session.grid.iter_blocks()},
+                )
+            self.prediction_render_mode = "blockwise"
+            self.render_mode_button.setChecked(True)
+            self.render_mode_button.setText("Block predictions")
+            self.render_mode_button.setToolTip("Re-run inference to rebuild the pixel classification view.")
+            self.status_label.setText(f"Loaded cached predictions and summary ({model_id}) for {obs_id}")
             return
 
         self._run_prediction(model_path, model_sig)
@@ -1160,8 +1216,7 @@ class MainWindow(QMainWindow):
         """Re-run inference over the open observation, replacing cached predictions.
 
         Needed because the prediction cache stores one class id per block; the
-        per-pixel maps, per-block confidence and the per-observation Neural-PCA
-        gallery live only in memory for the lifetime of a prediction run.
+        per-pixel maps live only in memory for the lifetime of a prediction run.
         """
         if not self.session or not self.model_path:
             return
@@ -1180,11 +1235,11 @@ class MainWindow(QMainWindow):
             return
         self._run_prediction(self.model_path, self._model_signature(self.model_path))
 
-    def _run_prediction(self, model_path: Path, model_sig: str) -> None:
+    def _run_prediction(self, model_path: Path, model_sig: str, *, preserve_labels=False) -> None:
         """Run the model over every non-nodata block and seed the results as labels."""
         from marslabeler.ui.predictdialog import PredictDialog
 
-        retired = self._retire_high_nodata_blocks()
+        retired = 0 if preserve_labels else self._retire_high_nodata_blocks()
         if retired:
             self.status_label.setText(
                 f"Skipping {retired} blocks >{self.config.inference.nodata_skip_threshold:.0%} "
@@ -1194,7 +1249,7 @@ class MainWindow(QMainWindow):
         blocks = [
             b
             for b in self.session.grid.iter_blocks()
-            if self.session.labels.get_record(b.block_id).status != "nodata"
+            if self.session.labels.get_record(b.block_id).status != "nodata" and b.w_px > 0 and b.h_px > 0
         ]
 
         dialog = PredictDialog(
@@ -1213,7 +1268,9 @@ class MainWindow(QMainWindow):
         )
         dialog.start()
 
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        result = dialog.exec()
+        dialog.worker.wait()
+        if result != QDialog.DialogCode.Accepted:
             msg = f"Inference failed: {dialog.error}" if dialog.error else "Inference cancelled"
             self.status_label.setText(msg)
             if dialog.error:
@@ -1222,10 +1279,38 @@ class MainWindow(QMainWindow):
 
         predictions = dialog.get_predictions()
         class_names = {cid: c.name for cid, c in self.classes_scheme.classes.items()}
-        self.session.labels.seed_bulk(predictions, class_names)
+        if not preserve_labels:
+            self.session.labels.seed_bulk(predictions, class_names)
         self.block_confidence = dialog.get_confidence()
         self.block_pixel_predictions = dialog.get_pixel_predictions()
+        self.block_features = dialog.get_block_features()
         self.local_npca_gallery = dialog.get_local_npca()
+        self.npca_error = getattr(dialog, "npca_error", "")
+        self.is_block_classifier = getattr(dialog, "is_block_classifier", False)
+        self.num_pixel_classes = getattr(dialog, "num_pixel_classes", 0)
+        from marslabeler.inference.summarycache import encode_summary
+        self._inference_summary = encode_summary(
+            self.block_confidence, self.local_npca_gallery,
+            block_classifier=self.is_block_classifier,
+            num_pixel_classes=self.num_pixel_classes,
+            npca_error=self.npca_error, checkpoint=model_path,
+        )
+        self.prediction_render_mode = "blockwise" if self.is_block_classifier else "pixelwise"
+        self.render_mode_button.setChecked(self.is_block_classifier)
+        self.render_mode_button.setText("Block predictions" if self.is_block_classifier else "Pixel-wise view")
+        if self.is_block_classifier:
+            self.render_mode_button.setToolTip(
+                f"The full classifier predicts {len(self.classes_scheme.classes)} classes per block. "
+                f"The pixel view comes from its {self.num_pixel_classes}-class segmentation backbone."
+            )
+        # Calibration maps belong to a particular prediction run. Re-running
+        # must never leave old uncertainty displayed against new predictions.
+        self.block_uncertainty, self.pixel_uncertainty = {}, {}
+        self.block_laplace, self.pixel_laplace = {}, {}
+        self.uncertainty_button.setChecked(False)
+        self.laplace_button.setChecked(False)
+        self.display_layer = "classes"
+        self.analysis_legend.setVisible(False)
         self.render_mode_button.setEnabled(bool(self.block_pixel_predictions))
         self._model_sig = model_sig
 
@@ -1244,8 +1329,15 @@ class MainWindow(QMainWindow):
             extra_meta = {
                 "model_sig": self._model_sig,
                 "model_stem": self.model_path.stem if self.model_path else None,
+                "inference_summary": self._inference_summary,
             }
             self.session.save_session(self.labels_dir, extra_meta=extra_meta)
+            if self.block_features is not None and self._model_sig:
+                from marslabeler.inference.blockanalysis import features_path
+                # Lets a cached reload draw the uncertainty maps without a model pass.
+                self.block_features.save(
+                    features_path(self.labels_dir, self.session.grid.obs_id), self._model_sig
+                )
             self._show_saved_feedback()
         except Exception as e:
             self._show_save_failure(e)
@@ -1281,43 +1373,72 @@ class MainWindow(QMainWindow):
             self.render_mode_button.setText("Block-wise view")
         else:
             self.prediction_render_mode = "pixelwise"
-            self.render_mode_button.setText("Pixel-wise view")
-        self._refresh_label_overlay()
+            self.render_mode_button.setText(
+                f"Segmentation pixels ({self.num_pixel_classes} classes)" if self.is_block_classifier else "Pixel-wise view"
+            )
+        self._refresh_view()
 
     def _toggle_uncertainty_layer(self) -> None:
         """Uncertainty Heatmap button: swap the class-color overlay for the
         Mahalanobis epistemic-uncertainty heatmap (computing it on first use)."""
-        if not self.session:
-            self.uncertainty_button.setChecked(False)
+        self._toggle_analysis_layer("mahalanobis")
+
+    def _toggle_laplace_layer(self):
+        self._toggle_analysis_layer("laplace")
+
+    def _toggle_analysis_layer(self, method):
+        button = self.laplace_button if method == "laplace" else self.uncertainty_button
+        other = self.uncertainty_button if method == "laplace" else self.laplace_button
+        if not self.session or not self.model_path:
+            button.setChecked(False)
             return
-
-        if not self.uncertainty_button.isChecked():
-            self.display_layer = "classes"
-            self._refresh_view()
-            return
-
-        if not self.block_uncertainty:
-            self._compute_uncertainty_layer()
-
-        if self.block_uncertainty:
-            self.display_layer = "uncertainty"
+        if self._showing_summary:
+            self._close_class_summary()
+        if button.isChecked():
+            scores = self.block_laplace if method == "laplace" else self.block_uncertainty
+            if not scores:
+                self._compute_uncertainty_layer(method)
+            scores = self.block_laplace if method == "laplace" else self.block_uncertainty
+            if not scores:
+                button.setChecked(False)
+                return  # Preserve a different active map when computation fails/cancels.
+            other.setChecked(False)
+            self.display_layer = "laplace" if method == "laplace" else "uncertainty"
+            if self.is_block_classifier:
+                self.analysis_legend.setText(
+                    "Laplace uncertainty · per block\n"
+                    "Blue 0 → red 1 · predictive entropy / log(classes)"
+                    if method == "laplace" else
+                    "Mahalanobis distance · per block\n"
+                    f"Blue 0 → yellow 1 (95% of training blocks) → red ≥ {self.mahalanobis_maximum:.3g}"
+                )
+            else:
+                self.analysis_legend.setText(
+                    "Laplace uncertainty · pixel map\nBlue 0 → red 1 · posterior mutual information"
+                    if method == "laplace" else
+                    "Mahalanobis distance · pixel map"
+                    f"\nBlue 0 → red ≥ {self.mahalanobis_maximum:.3g} · fixed calibration scale"
+                )
         else:
-            self.uncertainty_button.setChecked(False)
             self.display_layer = "classes"
+        self.analysis_legend.setVisible(self.display_layer != "classes")
         self._refresh_view()
 
-    def _compute_uncertainty_layer(self) -> None:
-        """Run the Mahalanobis uncertainty scorer over every non-nodata block."""
+    def _compute_uncertainty_layer(self, method="mahalanobis") -> None:
+        """Score every non-nodata block with `method` ("mahalanobis" | "laplace").
+
+        A block classifier is scored per block from the phi its prediction pass
+        kept; any other model gets a pixel map from a scoring pass.
+        """
         from marslabeler.ui.uncertaintydialog import UncertaintyDialog
 
-        # Idempotent: a no-op if _run_prediction already retired these blocks (the
-        # normal case); catches the cache-hit path, where it never ran.
-        self._retire_high_nodata_blocks()
-
+        # An analysis layer must never change a reviewed label's status.
         blocks = [
             b
             for b in self.session.grid.iter_blocks()
-            if self.session.labels.get_record(b.block_id).status != "nodata"
+            if self.session.labels.get_record(b.block_id).status != "nodata" and b.w_px > 0 and b.h_px > 0
+            and self.skip_decisions.get(b.block_id, {}).get("nodata_fraction", 0.0)
+                <= self.config.inference.nodata_skip_threshold
         ]
 
         dialog = UncertaintyDialog(
@@ -1331,18 +1452,31 @@ class MainWindow(QMainWindow):
                 "batch_size": self.config.inference.batch_size,
                 "context_multiplier": self.config.inference.context_multiplier,
                 "gsd_ratio": self.gsd_ratio,
+                "method": method,
+                "block_classifier": self.is_block_classifier,
+                "block_features": self.block_features,
             },
         )
         dialog.start()
 
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        dialog.worker.wait()
+        if not accepted:
             self.status_label.setText("Uncertainty heatmap unavailable")
             if dialog.error:
                 QMessageBox.information(self, "Uncertainty heatmap unavailable", dialog.error)
             return
 
-        self.block_uncertainty = dialog.get_scores()
-        self.status_label.setText(f"Computed uncertainty for {len(self.block_uncertainty)} blocks")
+        # A feature pass run for this map serves the other map too.
+        self.block_features = dialog.get_block_features() or self.block_features
+        if method == "laplace":
+            self.block_laplace = dialog.get_scores()
+            self.pixel_laplace = dialog.get_pixel_scores()
+        else:
+            self.block_uncertainty = dialog.get_scores()
+            self.pixel_uncertainty = dialog.get_pixel_scores()
+            self.mahalanobis_maximum = dialog.get_maximum()
+        self.status_label.setText(f"Computed {method} pixel map for {len(dialog.get_scores())} blocks")
 
     def _on_legend_class_clicked(self, class_id: int) -> None:
         """Legend row clicked: label the current block with that class.
@@ -1411,6 +1545,9 @@ class MainWindow(QMainWindow):
                 on_local_npca_clicked=self._on_local_npca_clicked,
                 block_confidence=self.block_confidence,
                 block_uncertainty=self.block_uncertainty,
+                block_laplace=self.block_laplace,
+                npca_error=self.npca_error,
+                block_scores=self.is_block_classifier,
             )
         except Exception as exc:
             traceback.print_exc()
@@ -1753,15 +1890,8 @@ class MainWindow(QMainWindow):
             return
         grid = self.session.grid
 
-        if self.display_layer == "uncertainty":
-            values = np.full(
-                (grid.blocks_per_panel_row, grid.blocks_per_panel_col), np.nan, dtype=np.float32
-            )
-            for block in grid.get_panel_blocks(self.current_panel_idx):
-                score = self.block_uncertainty.get(block.block_id)
-                if score is not None:
-                    values[block.block_row, block.block_col] = score
-            self.canvas.set_scalar_overlay(values)
+        x0, y0, _, _ = grid.get_panel_coords(self.current_panel_idx)
+        if self._render_pixel_analysis(x0, y0, grid.panel_size, grid.panel_size):
             return
 
         panel_blocks = grid.get_panel_blocks(self.current_panel_idx)
@@ -1779,6 +1909,46 @@ class MainWindow(QMainWindow):
             record = self.session.labels.get_record(block.block_id)
             block_data[block.block_row, block.block_col] = record.class_id
         self.canvas.set_label_overlay(block_data, self._class_colors())
+
+    def _render_pixel_analysis(self, x0, y0, width, height):
+        """Sample only visible score crops into a bounded display buffer.
+
+        A block with a score but no pixel crop (a block classifier's maps are
+        per block) fills its own extent with that score.
+        """
+        if self.display_layer == "uncertainty":
+            maps, scores, maximum = self.pixel_uncertainty, self.block_uncertainty, self.mahalanobis_maximum
+        elif self.display_layer == "laplace":
+            maps, scores, maximum = self.pixel_laplace, self.block_laplace, 1.0
+        else:
+            return False
+        if not maps and not scores:
+            return False
+        out_w, out_h = self.canvas.canvas_width, self.canvas.canvas_height
+        values = np.full((out_h, out_w), np.nan, dtype=np.float32)
+        # Global sample positions keep adjacent blocks/panels aligned, including
+        # partial edge blocks; never stretch one crop over a whole block cell.
+        xs = x0 + np.arange(out_w) * width / out_w
+        ys = y0 + np.arange(out_h) * height / out_h
+        for block in self.session.grid.iter_blocks():
+            if (block.x_px >= x0 + width or block.y_px >= y0 + height
+                    or block.x_px + block.w_px <= x0 or block.y_px + block.h_px <= y0):
+                continue
+            cols = np.flatnonzero((xs >= block.x_px) & (xs < block.x_px + block.w_px))
+            rows = np.flatnonzero((ys >= block.y_px) & (ys < block.y_px + block.h_px))
+            if not len(rows) or not len(cols):
+                continue
+            crop = maps.get(block.block_id)
+            if crop is None:
+                score = scores.get(block.block_id)
+                if score is not None:
+                    values[np.ix_(rows, cols)] = score
+                continue
+            rr = np.minimum((ys[rows] - block.y_px).astype(int), crop.shape[0] - 1)
+            cc = np.minimum((xs[cols] - block.x_px).astype(int), crop.shape[1] - 1)
+            values[np.ix_(rows, cols)] = crop[np.ix_(rr, cc)]
+        self.canvas.set_pixel_scalar_overlay(values, maximum=maximum)
+        return True
 
     def _build_pixel_class_array(self, panel_blocks: list) -> np.ndarray:
         """Native-resolution (panel h x panel w) array of per-pixel predicted
@@ -2183,22 +2353,10 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Overview — click a panel to open it, O or Esc to go back")
 
     def _render_overview_predictions(self, panels_across: int, panels_down: int) -> None:
-        """Predictions-mode overview overlay: per-panel majority class, or per-panel
-        mean uncertainty when the Uncertainty Heatmap layer is toggled on."""
+        """Predictions-mode overview overlay: per-panel majority class, or the
+        active uncertainty map sampled over the whole observation."""
         grid = self.session.grid
-
-        if self.display_layer == "uncertainty":
-            values = np.full((panels_down, panels_across), np.nan, dtype=np.float32)
-            for p in range(grid.num_panels):
-                pr, pc = divmod(p, panels_across)
-                scores = [
-                    self.block_uncertainty[b.block_id]
-                    for b in grid.get_panel_blocks(p)
-                    if b.block_id in self.block_uncertainty
-                ]
-                if scores:
-                    values[pr, pc] = sum(scores) / len(scores)
-            self.canvas.set_scalar_overlay(values)
+        if self._render_pixel_analysis(0, 0, panels_across * grid.panel_size, panels_down * grid.panel_size):
             return
 
         cell_data = np.full((panels_down, panels_across), -3, dtype=np.int16)
@@ -2249,6 +2407,8 @@ class MainWindow(QMainWindow):
                     block = grid.get_block(idx)
                     cell_data[r, c] = self.session.labels.get_record(block.block_id).class_id
         self.canvas.set_label_overlay(cell_data, self._class_colors())
+        self._render_pixel_analysis(pc0 * grid.panel_size, pr0 * grid.panel_size,
+                                    span * grid.panel_size, span * grid.panel_size)
 
         cb = self.session.current_block()
         self.canvas.set_current_block_highlight(

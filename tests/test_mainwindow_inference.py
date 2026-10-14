@@ -5,6 +5,7 @@ dialog + QThread) -- constructs Session/Grid/LabelStore directly and assigns the
 onto a bare MainWindow, the same way test_session.py tests Session in isolation.
 """
 
+import numpy as np
 import pytest
 from pathlib import Path
 from rasterio.transform import Affine
@@ -99,6 +100,42 @@ def test_inference_nodata_skip_threshold_default(qapp):
     assert window.config.inference.nodata_skip_threshold == pytest.approx(0.33)
 
 
+def test_summary_refresh_preserves_reviewed_label_even_above_nodata_threshold(
+    window_with_session, monkeypatch, tmp_path,
+):
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QDialog
+    import marslabeler.ui.predictdialog as module
+
+    window = window_with_session
+    window.classes_scheme = load_classes(window.config.paths.classes_file)
+    block = next(window.session.grid.iter_blocks())
+    window.session.labels.assign(block.block_id, 1, window.classes_scheme.get_name(1))
+    before = window.session.labels.get_record(block.block_id).__dict__.copy()
+    window.skip_decisions[block.block_id] = {"nodata_fraction": .9}
+
+    class Dialog:
+        worker = SimpleNamespace(wait=lambda: None)
+        is_block_classifier = True
+        num_pixel_classes = 14
+        def __init__(self, *args): pass
+        def start(self): pass
+        def exec(self): return QDialog.DialogCode.Accepted
+        def get_predictions(self): return {block.block_id: 2}
+        def get_confidence(self): return {block.block_id: .9}
+        def get_pixel_predictions(self): return {}
+        def get_local_npca(self): return {}
+        def get_block_features(self): return None
+
+    monkeypatch.setattr(module, "PredictDialog", Dialog)
+    monkeypatch.setattr(window, "_refresh_view", lambda: None)
+    monkeypatch.setattr(window, "_refresh_history", lambda: None)
+    window._run_prediction(tmp_path / "model.pt", "test", preserve_labels=True)
+    assert window.session.labels.get_record(block.block_id).__dict__ == before
+    assert window.block_confidence == {block.block_id: .9}
+    assert not window.block_uncertainty and not window.block_laplace
+
+
 @pytest.fixture
 def window_with_multi_panel_session(qapp, synthetic_geotiff):
     """A predictions-mode MainWindow with a 2x2-panel grid, predictions seeded so
@@ -146,24 +183,26 @@ def test_render_overview_predictions_shows_majority_class_not_done_tint(window_w
     assert len(set(cell_data.ravel().tolist())) == 4
 
 
-def test_render_overview_predictions_uncertainty_layer_shows_per_panel_mean(window_with_multi_panel_session):
+def test_render_overview_predictions_uncertainty_layer_draws_block_scores(window_with_multi_panel_session):
+    """Per-block scores (a block classifier's maps) are drawn at their blocks."""
     window = window_with_multi_panel_session
     window.display_layer = "uncertainty"
+    window.mahalanobis_maximum = 2.0
     grid = window.session.grid
-    # Distinct uncertainty scores per panel so per-panel means are distinguishable.
+    # Distinct uncertainty scores per panel so their positions are distinguishable.
     for p in range(grid.num_panels):
         for block in grid.get_panel_blocks(p):
             window.block_uncertainty[block.block_id] = p * 0.1
+    window.canvas.canvas_width = window.canvas.canvas_height = 4
 
     captured = {}
-    window.canvas.set_scalar_overlay = lambda values: captured.update(values=values.copy())
+    window.canvas.set_pixel_scalar_overlay = lambda values, **kw: captured.update(values=values.copy(), **kw)
 
     window._render_overview_predictions(panels_across=2, panels_down=2)
 
-    values = captured["values"]
-    for p in range(4):
-        pr, pc = divmod(p, 2)
-        assert values[pr, pc] == pytest.approx(p * 0.1)
+    expected = np.repeat(np.repeat([[0.0, 0.1], [0.2, 0.3]], 2, axis=0), 2, axis=1)
+    np.testing.assert_allclose(captured["values"], expected)
+    assert captured["maximum"] == 2.0
 
 
 def test_forward_logits_is_a_tensor_for_an_ig_trained_checkpoint():

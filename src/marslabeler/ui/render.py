@@ -294,3 +294,21 @@ def create_pixel_class_overlay(
 
     qimage = QImage(rgba.data, out_width, out_height, out_width * 4, QImage.Format.Format_RGBA8888)
     return QPixmap.fromImage(qimage)
+
+
+def create_pixel_heatmap_overlay(values: np.ndarray, out_width: int, out_height: int,
+                                 *, maximum: float = 1.0, alpha: float = 0.5) -> QPixmap:
+    """Render a spatial score field with a fixed scale and transparent missing pixels."""
+    if maximum <= 0 or not np.isfinite(maximum):
+        raise ValueError("Heatmap maximum must be finite and positive")
+    sampled = _nearest_neighbor_resize(values, out_height, out_width)
+    valid = np.isfinite(sampled)
+    scaled = np.clip(np.where(valid, sampled, 0) / maximum, 0, 1)
+    lut = np.array([
+        (*value_to_heatmap_color(i / 255).getRgb()[:3], int(round(255 * alpha)))
+        for i in range(256)
+    ], dtype=np.uint8)
+    rgba = np.ascontiguousarray(lut[(scaled * 255).astype(np.uint8)])
+    rgba[~valid] = 0
+    qimage = QImage(rgba.data, out_width, out_height, out_width * 4, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimage)

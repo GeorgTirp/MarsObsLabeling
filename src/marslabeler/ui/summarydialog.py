@@ -105,13 +105,21 @@ class ClassSummaryView(QWidget):
         local_npca_gallery: dict | None = None,
         on_local_npca_clicked=None,
         parent=None,
+        *,
+        block_laplace: dict[str, float] | None = None,
+        npca_error: str = "",
+        block_scores: bool = False,
     ):
         super().__init__(parent)
         self.classes_scheme = classes_scheme
         self.session = session
+        # A block classifier's scores are per block: temperature-calibrated
+        # confidence, and Mahalanobis distance relative to the training blocks.
+        self.block_scores = block_scores
         self.npca_gallery = npca_gallery or {}
         self.block_confidence = block_confidence or {}
         self.block_uncertainty = block_uncertainty or {}
+        self.block_laplace = block_laplace or {}
         self.local_npca_gallery = local_npca_gallery or {}
         if on_local_npca_clicked is not None:
             self.local_block_clicked.connect(on_local_npca_clicked)
@@ -152,6 +160,11 @@ class ClassSummaryView(QWidget):
         selector_row.addWidget(self.source_combo)
         selector_row.addStretch()
         outer.addLayout(selector_row)
+        if npca_error:
+            notice = QLabel(f"Observation Neural-PCA unavailable: {npca_error}")
+            notice.setWordWrap(True)
+            notice.setStyleSheet("color: #e9bc70; font-size: 11px;")
+            outer.addWidget(notice)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -327,10 +340,7 @@ class ClassSummaryView(QWidget):
                     "corpus\" to see what the model learned for it."
                 )
             else:
-                text = (
-                    "Neural PCA gallery not available yet -- needs a trained model + a "
-                    "calibration pass (AI4ExoMars/vision_backend/pc_align/fit_neural_pca.py)."
-                )
+                text = "No fitted Neural-PCA gallery is available for this class."
             placeholder = QLabel(text)
             placeholder.setStyleSheet("color: #91a0b2; font-size: 11px;")
             placeholder.setWordWrap(True)
@@ -371,16 +381,27 @@ class ClassSummaryView(QWidget):
 
         avg_confidence = self._mean_score(cls.id, self.block_confidence)
         avg_uncertainty = self._mean_score(cls.id, self.block_uncertainty)
+        avg_laplace = self._mean_score(cls.id, self.block_laplace)
 
-        confidence_text = f"{avg_confidence:.2f}" if avg_confidence is not None else "N/A -- run inference"
-        uncertainty_text = (
-            f"{avg_uncertainty:.2f}" if avg_uncertainty is not None else "N/A -- run Uncertainty Heatmap"
+        confidence_text = (
+            f"{avg_confidence:.2f}" if avg_confidence is not None else
+            ("— (no blocks)" if not count else "N/A -- run inference")
         )
+        uncertainty_text = (
+            f"{avg_uncertainty:.2f}" if avg_uncertainty is not None else "not computed (click its map)"
+        )
+        laplace_text = f"{avg_laplace:.3f}" if avg_laplace is not None else "not computed (click its map)"
 
+        confidence_name = "Avg. calibrated confidence" if self.block_scores else "Avg. softmax confidence"
+        distance_name = (
+            "Mean Mahalanobis distance (1 = 95% of training blocks)" if self.block_scores
+            else "Mean Mahalanobis distance"
+        )
         label = QLabel(
             f"Coverage: {coverage_pct:.1f}% ({count}/{total} blocks)   |   "
-            f"Avg. softmax confidence: {confidence_text}   |   "
-            f"Avg. epistemic uncertainty: {uncertainty_text}"
+            f"{confidence_name}: {confidence_text}   |   "
+            f"{distance_name}: {uncertainty_text}   |   "
+            f"Mean Laplace uncertainty: {laplace_text}"
         )
         label.setStyleSheet("color: #cccccc; font-size: 11px; padding-top: 4px;")
         label.setWordWrap(True)
@@ -410,6 +431,9 @@ class ClassSummaryDialog(QDialog):
         local_npca_gallery: dict | None = None,
         on_local_npca_clicked=None,
         parent=None,
+        *,
+        block_laplace: dict[str, float] | None = None,
+        npca_error: str = "",
     ):
         super().__init__(parent)
         self.view = ClassSummaryView(
@@ -420,6 +444,8 @@ class ClassSummaryDialog(QDialog):
             block_uncertainty=block_uncertainty,
             local_npca_gallery=local_npca_gallery,
             on_local_npca_clicked=on_local_npca_clicked,
+            block_laplace=block_laplace,
+            npca_error=npca_error,
         )
         self.view.back_button.setVisible(False)  # a window closes by its own chrome
         self.view.thumbnail_clicked.connect(self.thumbnail_clicked)

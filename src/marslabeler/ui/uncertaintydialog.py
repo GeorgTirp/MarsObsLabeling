@@ -7,6 +7,10 @@ artifact (`MahalanobisStats`, produced offline by
 labeled crops) -- conventionally a `<checkpoint_stem>.uncertainty.pt` sidecar next to
 the checkpoint. Until a trained model has been calibrated, that sidecar won't exist;
 this dialog reports that clearly (via `failed`) rather than fabricating a heatmap.
+
+A Stage-4 block classifier is scored per block from its phi instead
+(`inference.blockanalysis`): from the prediction pass's phi when the caller has
+it, otherwise after one feature pass over the blocks.
 """
 
 from pathlib import Path
@@ -20,7 +24,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from marslabeler.inference.engine import compute_global_quantization, run_block_scores
+from marslabeler.inference.engine import compute_global_quantization, run_block_scores_with_pixel_maps
+from marslabeler.inference.pixelmaps import PixelMapStore
 from marslabeler.io.raster import RasterSource
 from marslabeler.model.grid import BlockInfo
 
@@ -48,9 +53,110 @@ class UncertaintyWorker(QThread):
         self.checkpoint_path = checkpoint_path
         self.inference_config = inference_config
         self._cancelled = False
+        self.pixel_scores = {}
+        self.maximum = 1.0
+        self.method = inference_config.get("method", "mahalanobis")
+        # Stage-4 phi/logits: given by the caller when the prediction pass kept
+        # them, otherwise collected here (and handed back) in one feature pass.
+        self.block_features = inference_config.get("block_features")
 
     def cancel(self) -> None:
         self._cancelled = True
+
+    def _load_model(self):
+        """(bundle, plan, quantization bounds) for a pass over self.blocks."""
+        from marslabeler.inference.modelio import build_inference_plan, load_model_bundle
+
+        self.status.emit(f"Loading model {self.checkpoint_path.name}...")
+        bundle = load_model_bundle(
+            self.checkpoint_path,
+            device=self.inference_config.get("device", "auto"),
+            ai4exomars_path=self.inference_config.get("ai4exomars_path"),
+        )
+        plan = build_inference_plan(
+            bundle,
+            block_size=self.block_size,
+            batch_size=self.inference_config.get("batch_size", 4),
+            context_multiplier=self.inference_config.get("context_multiplier", 4),
+            gsd_ratio=self.inference_config.get("gsd_ratio", 1.0),
+        )
+        quantization_bounds = None
+        if self.raster.dtype != "uint8":
+            self.status.emit(
+                f"Non-uint8 imagery ({self.raster.dtype}) -- computing a global "
+                "brightness stretch to 8-bit (approximation; see docs)..."
+            )
+            quantization_bounds = compute_global_quantization(
+                self.raster, self.raster.width, self.raster.height
+            )
+        return bundle, plan, quantization_bounds
+
+    def _progress(self, verb: str):
+        def progress_cb(done: int, total: int) -> None:
+            self.progress.emit(done, total)
+            self.status.emit(f"{verb} block {done}/{total}...")
+        return progress_cb
+
+    def _missing_calibration(self, path: Path) -> None:
+        self.failed.emit(
+            f"No {self.method} calibration found for this model at:\n{path}\n\n"
+            "Use calibration fitted for this exact checkpoint. "
+            "A training prior or calibration from an older model is not interchangeable."
+        )
+
+    def _collect_block_features(self):
+        """One block-classifier pass keeping phi and logits; None if cancelled."""
+        from marslabeler.inference.blockanalysis import BlockFeatures
+        from marslabeler.inference.engine import run_block_inference_with_pixel_maps
+        from marslabeler.inference.modelio import make_prediction_analysis_fn
+
+        bundle, plan, quantization_bounds = self._load_model()
+        if not bundle.block_classifier:
+            raise ValueError("Block-level uncertainty needs a Stage-4 block classifier checkpoint.")
+        predict_fn, phi_sink, _, _, logit_sink = make_prediction_analysis_fn(
+            bundle, quantization_bounds, blocks=self.blocks, plan=plan,
+        )
+        run_block_inference_with_pixel_maps(
+            self.raster, self.blocks, plan, predict_fn,
+            progress_cb=self._progress("Extracting features of"),
+            should_cancel=lambda: self._cancelled, keep_pixel_maps=False,
+        )
+        if self._cancelled:
+            return None
+        return BlockFeatures.from_batches(self.blocks, phi_sink, logit_sink, bundle.model)
+
+    def _run_block_level(self, stats_path: Path) -> None:
+        from marslabeler.inference.blockanalysis import (
+            MAHALANOBIS_DISPLAY_MAXIMUM,
+            block_laplace_scores,
+            block_mahalanobis_scores,
+        )
+
+        if self.block_features is None:
+            self.block_features = self._collect_block_features()
+            if self.block_features is None:
+                self.status.emit("Cancelled")
+                self.finished_ok.emit({})
+                return
+        ai4exomars_path = self.inference_config.get("ai4exomars_path")
+        if self.method == "laplace":
+            self.status.emit(f"Sampling the Laplace posterior ({stats_path.name})...")
+            scores = block_laplace_scores(
+                self.block_features, stats_path, ai4exomars_path=ai4exomars_path,
+                progress_cb=self._progress("Scoring"), should_cancel=lambda: self._cancelled,
+            )
+        else:
+            scores = block_mahalanobis_scores(self.block_features, stats_path, ai4exomars_path=ai4exomars_path)
+            self.maximum = MAHALANOBIS_DISPLAY_MAXIMUM
+        if self._cancelled:
+            self.status.emit("Cancelled")
+            self.finished_ok.emit({})
+            return
+        # Blocks retired as nodata since the prediction pass get no score.
+        wanted = {block.block_id for block in self.blocks}
+        scores = {block_id: score for block_id, score in scores.items() if block_id in wanted}
+        self.status.emit(f"Scored {len(scores)} blocks")
+        self.finished_ok.emit(scores)
 
     def run(self) -> None:
         try:
@@ -59,67 +165,50 @@ class UncertaintyWorker(QThread):
                 return
 
             from marslabeler.inference.modelio import (
-                VisionBackendNotFound,
-                build_inference_plan,
-                load_model_bundle,
                 load_uncertainty_stats,
                 make_uncertainty_score_fn,
                 sidecar_path,
             )
 
-            stats_path = sidecar_path(self.checkpoint_path, "uncertainty.pt")
+            suffix = "laplace.pt" if self.method == "laplace" else "uncertainty.pt"
+            stats_path = sidecar_path(self.checkpoint_path, suffix)
             self.status.emit(f"Loading uncertainty calibration ({stats_path.name})...")
-            try:
-                stats = load_uncertainty_stats(
-                    stats_path, ai4exomars_path=self.inference_config.get("ai4exomars_path")
-                )
-            except FileNotFoundError:
-                self.failed.emit(
-                    f"No uncertainty calibration found for this model at:\n{stats_path}\n\n"
-                    "Fit it once from a trained checkpoint with:\n"
-                    "AI4ExoMars/vision_backend/uncertainty/fit_gaussians.py "
-                    f"--checkpoint {self.checkpoint_path}"
-                )
+            if not stats_path.exists():
+                self._missing_calibration(stats_path)
+                return
+            if self.block_features is not None or self.inference_config.get("block_classifier"):
+                self._run_block_level(stats_path)
                 return
 
-            self.status.emit(f"Loading model {self.checkpoint_path.name}...")
-            bundle = load_model_bundle(
-                self.checkpoint_path,
-                device=self.inference_config.get("device", "auto"),
-                ai4exomars_path=self.inference_config.get("ai4exomars_path"),
-            )
-            plan = build_inference_plan(
-                bundle,
-                block_size=self.block_size,
-                batch_size=self.inference_config.get("batch_size", 4),
-                context_multiplier=self.inference_config.get("context_multiplier", 4),
-                gsd_ratio=self.inference_config.get("gsd_ratio", 1.0),
-            )
-            quantization_bounds = None
-            if self.raster.dtype != "uint8":
-                self.status.emit(
-                    f"Non-uint8 imagery ({self.raster.dtype}) -- computing a global "
-                    "brightness stretch to 8-bit (approximation; see docs)..."
-                )
-                quantization_bounds = compute_global_quantization(
-                    self.raster, self.raster.width, self.raster.height
-                )
+            stats = None
+            if self.method == "mahalanobis":
+                try:
+                    stats = load_uncertainty_stats(
+                        stats_path, ai4exomars_path=self.inference_config.get("ai4exomars_path")
+                    )
+                except FileNotFoundError:
+                    self._missing_calibration(stats_path)
+                    return
 
-            score_fn = make_uncertainty_score_fn(bundle, stats, quantization_bounds)
+            bundle, plan, quantization_bounds = self._load_model()
+
+            if self.method == "laplace":
+                from marslabeler.inference.laplace import make_laplace_score_fn
+                score_fn = make_laplace_score_fn(bundle, stats_path, quantization_bounds)
+            else:
+                score_fn = make_uncertainty_score_fn(bundle, stats, quantization_bounds, normalize=False)
+                self.maximum = float(stats.reference_max_distance or 1.0)
 
             self.status.emit("Computing uncertainty heatmap...")
 
-            def progress_cb(done: int, total: int) -> None:
-                self.progress.emit(done, total)
-                self.status.emit(f"Scoring block {done}/{total}...")
-
-            scores = run_block_scores(
+            scores, pixels = run_block_scores_with_pixel_maps(
                 self.raster,
                 self.blocks,
                 plan,
                 score_fn,
-                progress_cb=progress_cb,
+                progress_cb=self._progress("Scoring"),
                 should_cancel=lambda: self._cancelled,
+                map_store=PixelMapStore(),
             )
 
             if self._cancelled:
@@ -128,10 +217,8 @@ class UncertaintyWorker(QThread):
                 return
 
             self.status.emit(f"Scored {len(scores)} blocks")
+            self.pixel_scores = pixels
             self.finished_ok.emit(scores)
-
-        except VisionBackendNotFound as e:
-            self.failed.emit(str(e))
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -148,7 +235,8 @@ class UncertaintyDialog(QDialog):
         inference_config: dict,
     ):
         super().__init__()
-        self.setWindowTitle("Computing Uncertainty Heatmap")
+        name = "Laplace uncertainty" if inference_config.get("method") == "laplace" else "Mahalanobis distance"
+        self.setWindowTitle(f"Computing {name}")
         self.setModal(True)
         self.setMinimumWidth(420)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
@@ -158,7 +246,8 @@ class UncertaintyDialog(QDialog):
 
         layout = QVBoxLayout()
 
-        title = QLabel(f"Mahalanobis Uncertainty ({checkpoint_path.name})")
+        scope = "per block" if inference_config.get("block_classifier") else "pixel map"
+        title = QLabel(f"{name} · {scope} ({checkpoint_path.name})")
         title.setStyleSheet("font-weight: bold; padding: 10px;")
         layout.addWidget(title)
 
@@ -209,3 +298,13 @@ class UncertaintyDialog(QDialog):
 
     def get_scores(self) -> dict[str, float]:
         return self.scores
+
+    def get_pixel_scores(self):
+        return self.worker.pixel_scores
+
+    def get_maximum(self):
+        return self.worker.maximum
+
+    def get_block_features(self):
+        """Stage-4 phi/logits used for the scores (blockanalysis.BlockFeatures), else None."""
+        return self.worker.block_features

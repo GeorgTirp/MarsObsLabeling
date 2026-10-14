@@ -15,6 +15,7 @@ from marslabeler.ui.render import (
     create_heatmap_overlay,
     create_current_block_highlight,
     create_pixel_class_overlay,
+    create_pixel_heatmap_overlay,
 )
 
 
@@ -192,6 +193,15 @@ class PanelCanvas(QGraphicsView):
             self.label_overlay_item = self.scene.addPixmap(overlay_pixmap)
         else:
             self.label_overlay_item.setPixmap(overlay_pixmap)
+
+    def set_pixel_scalar_overlay(self, values: np.ndarray, *, maximum: float = 1.0) -> None:
+        pixmap = create_pixel_heatmap_overlay(
+            values, self.canvas_width, self.canvas_height, maximum=maximum,
+        )
+        if self.label_overlay_item is None:
+            self.label_overlay_item = self.scene.addPixmap(pixmap)
+        else:
+            self.label_overlay_item.setPixmap(pixmap)
 
     def set_current_block_highlight(self, block_row: int, block_col: int) -> None:
         """
